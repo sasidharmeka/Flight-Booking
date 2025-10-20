@@ -13,37 +13,58 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # Authenticate to GCP with your SA key JSON secret
       - id: auth
         uses: google-github-actions/auth@v2
         with:
           credentials_json: ${{ secrets.GCP_SA_KEY }}
 
-      # Install gcloud/gsutil
       - uses: google-github-actions/setup-gcloud@v2
 
-      - name: Upload DAG to bucket/dags
+      - name: Upload DAG to bucket prefix
         env:
-          AIRFLOW_BUCKET_NAME: ${{ vars.AIRFLOW_BUCKET_NAME }}  # bare name only, e.g. my-bucket
+          # EITHER set this to "gs://your-bucket/dags" OR to just "your-bucket"
+          AIRFLOW_BUCKET_URL: ${{ vars.AIRFLOW_BUCKET_NAME }}
+          DEFAULT_PREFIX: dags
           LOCAL_DAG_PATH: airflow_job/airflow_job.py
         run: |
           set -euo pipefail
 
-          # sanity checks
-          if [[ "$AIRFLOW_BUCKET_NAME" == *"/"* || "$AIRFLOW_BUCKET_NAME" == gs://* ]]; then
-            echo "ERROR: AIRFLOW_BUCKET_NAME must be the bare bucket name (no gs://, no slashes)."
+          raw="$AIRFLOW_BUCKET_URL"
+
+          # If it starts with gs://, strip it and split into bucket + optional prefix
+          if [[ "$raw" == gs://* ]]; then
+            tmp="${raw#gs://}"               # strip scheme
+            BUCKET="${tmp%%/*}"              # before first slash
+            rest="${tmp#*/}"                 # after first slash
+            [[ "$rest" == "$tmp" ]] && PREFIX="" || PREFIX="$rest"
+          else
+            # treat value as bare bucket name; default prefix = dags/
+            BUCKET="$raw"
+            PREFIX="$DEFAULT_PREFIX"
+          fi
+
+          # Basic validation
+          if [[ -z "$BUCKET" || "$BUCKET" == */* ]]; then
+            echo "ERROR: Invalid bucket spec. Provide 'gs://bucket[/prefix]' or just 'bucket'."
             exit 1
           fi
 
-          # ensure bucket exists
-          if ! gsutil ls -b "gs://$AIRFLOW_BUCKET_NAME" >/dev/null 2>&1; then
-            echo "ERROR: Bucket gs://$AIRFLOW_BUCKET_NAME does not exist."
+          # Ensure bucket exists
+          if ! gsutil ls -b "gs://$BUCKET" >/dev/null 2>&1; then
+            echo "ERROR: Bucket gs://$BUCKET does not exist."
             exit 1
           fi
 
-          # upload to dags/ (folder/prefix will be created if missing)
-          echo "Uploading $LOCAL_DAG_PATH to gs://$AIRFLOW_BUCKET_NAME/dags/"
-          gsutil cp "$LOCAL_DAG_PATH" "gs://$AIRFLOW_BUCKET_NAME/dags/"
+          # Build destination (prefix may be empty)
+          if [[ -n "${PREFIX:-}" ]]; then
+            # normalize to end with a trailing slash
+            DEST="gs://$BUCKET/${PREFIX%/}/"
+          else
+            DEST="gs://$BUCKET/"
+          fi
+
+          echo "Uploading $LOCAL_DAG_PATH -> $DEST"
+          gsutil cp "$LOCAL_DAG_PATH" "$DEST"
 
   Bucket-Create-And-Seed:
     runs-on: ubuntu-latest
