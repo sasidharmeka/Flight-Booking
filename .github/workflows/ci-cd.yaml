@@ -19,37 +19,55 @@ jobs:
           gcp_access_key: ${{ secrets.GCP_SA_KEY }}  # your JSON secret
           bucket_name: ${{ vars.AIRFLOW_BUCKET_NAME }}               # repo-level variable
           file_name: airflow_job/airflow_job.py                          # path inside the repo
+        # Add derived columns
   Bucket-Create-And-Seed:
-      runs-on: ubuntu-latest
-      steps:
-        - uses: actions/checkout@v4
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
 
-        # Authenticate to GCP with your SA key JSON secret
-        - id: auth
-          uses: google-github-actions/auth@v2
-          with:
-            credentials_json: ${{ secrets.GCP_SA_KEY }}
+      # Authenticate to GCP with your SA key JSON secret
+      - id: auth
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
 
-        # Install gcloud/gsutil
-        - uses: google-github-actions/setup-gcloud@v2
+      # Install gcloud/gsutil
+      - uses: google-github-actions/setup-gcloud@v2
 
-        - name: Create bucket (if needed) and folders
-          env:
-            BUCKET_NAME: ${{ vars.BUCKET_NAME }}   # must be globally unique, no "gs://"
-            LOCATION: us-central1                  # pick your region
-          run: |
-            set -euo pipefail
+      - name: Create bucket (if needed) and folders
+        env:
+          BUCKET_NAME: ${{ vars.BUCKET_NAME }}   # e.g. my-unique-bucket-name (NO gs://, NO slashes)
+          LOCATION: us-central1                  # change if needed
+        run: |
+          set -euo pipefail
 
-            # Create the bucket if it doesn't exist (idempotent)
-            if ! gsutil ls -b gs://"$BUCKET_NAME" >/dev/null 2>&1; then
-              gsutil mb -l "$LOCATION" gs://"$BUCKET_NAME"
-              # Recommended hardening (optional):
-              gsutil uniformbucketlevelaccess set on gs://"$BUCKET_NAME"
-              gsutil pap set enforced gs://"$BUCKET_NAME"        # public access prevention
+          # Validate bucket name (must not include path segments)
+          if [[ "$BUCKET_NAME" == *"/"* ]]; then
+            echo "ERROR: BUCKET_NAME must be a bare name (no slashes). Given: '$BUCKET_NAME'"
+            exit 1
+          fi
+
+          # Create the bucket if it doesn't exist (idempotent)
+          if ! gsutil ls -b "gs://$BUCKET_NAME" >/dev/null 2>&1; then
+            echo "Creating bucket gs://$BUCKET_NAME in $LOCATION"
+            gsutil mb -l "$LOCATION" "gs://$BUCKET_NAME"
+            # Optional hardening:
+            gsutil uniformbucketlevelaccess set on "gs://$BUCKET_NAME"
+            gsutil pap set enforced "gs://$BUCKET_NAME"   # public access prevention
+          else
+            echo "Bucket gs://$BUCKET_NAME already exists"
+          fi
+
+          # Create 5 top-level folders (prefixes), skip if they already exist
+          FOLDERS=("data" "output" "source-dev" "source-prod" "spark-job")
+          for dir in "${FOLDERS[@]}"; do
+            if ! gsutil ls -d "gs://$BUCKET_NAME/$dir/" >/dev/null 2>&1; then
+              echo "Creating folder gs://$BUCKET_NAME/$dir/"
+              gsutil mkdir "gs://$BUCKET_NAME/$dir"
+            else
+              echo "Folder gs://$BUCKET_NAME/$dir/ already exists"
             fi
-
-            # Create 5 top-level folders (prefixes)
-            gsutil -m mkdir gs://"$BUCKET_NAME"/{data,output,source-dev,source-prod,spark-job}
+          done
   upload-to-dev:
     if: github.ref == 'refs/heads/dev'
     runs-on: ubuntu-latest
