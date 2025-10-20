@@ -13,13 +13,38 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - id: deploy
-        uses: bitovi/github-actions-gcp-bucket@v1
+      # Authenticate to GCP with your SA key JSON secret
+      - id: auth
+        uses: google-github-actions/auth@v2
         with:
-          gcp_access_key: ${{ secrets.GCP_SA_KEY }}  # your JSON secret
-          bucket_name: ${{ vars.AIRFLOW_BUCKET_NAME }}               # repo-level variable
-          file_name: airflow_job/airflow_job.py                          # path inside the repo
-        # Add derived columns
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+      # Install gcloud/gsutil
+      - uses: google-github-actions/setup-gcloud@v2
+
+      - name: Upload DAG to bucket/dags
+        env:
+          AIRFLOW_BUCKET_NAME: ${{ vars.AIRFLOW_BUCKET_NAME }}  # bare name only, e.g. my-bucket
+          LOCAL_DAG_PATH: airflow_job/airflow_job.py
+        run: |
+          set -euo pipefail
+
+          # sanity checks
+          if [[ "$AIRFLOW_BUCKET_NAME" == *"/"* || "$AIRFLOW_BUCKET_NAME" == gs://* ]]; then
+            echo "ERROR: AIRFLOW_BUCKET_NAME must be the bare bucket name (no gs://, no slashes)."
+            exit 1
+          fi
+
+          # ensure bucket exists
+          if ! gsutil ls -b "gs://$AIRFLOW_BUCKET_NAME" >/dev/null 2>&1; then
+            echo "ERROR: Bucket gs://$AIRFLOW_BUCKET_NAME does not exist."
+            exit 1
+          fi
+
+          # upload to dags/ (folder/prefix will be created if missing)
+          echo "Uploading $LOCAL_DAG_PATH to gs://$AIRFLOW_BUCKET_NAME/dags/"
+          gsutil cp "$LOCAL_DAG_PATH" "gs://$AIRFLOW_BUCKET_NAME/dags/"
+
   Bucket-Create-And-Seed:
     runs-on: ubuntu-latest
     steps:
