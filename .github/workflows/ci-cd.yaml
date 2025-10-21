@@ -8,64 +8,9 @@ on:
   workflow_dispatch:
 
 jobs:
-  Bucket-Airflow-Deploy:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - id: auth
-        uses: google-github-actions/auth@v2
-        with:
-          credentials_json: ${{ secrets.GCP_SA_KEY }}
-
-      - uses: google-github-actions/setup-gcloud@v2
-
-      - name: Upload DAG to bucket prefix
-        env:
-          # EITHER set this to "gs://your-bucket/dags" OR to just "your-bucket"
-          AIRFLOW_BUCKET_URL: ${{ vars.AIRFLOW_BUCKET_NAME }}
-          DEFAULT_PREFIX: dags
-          LOCAL_DAG_PATH: airflow_job/airflow_job.py
-        run: |
-          set -euo pipefail
-
-          raw="$AIRFLOW_BUCKET_URL"
-
-          # If it starts with gs://, strip it and split into bucket + optional prefix
-          if [[ "$raw" == gs://* ]]; then
-            tmp="${raw#gs://}"               # strip scheme
-            BUCKET="${tmp%%/*}"              # before first slash
-            rest="${tmp#*/}"                 # after first slash
-            [[ "$rest" == "$tmp" ]] && PREFIX="" || PREFIX="$rest"
-          else
-            # treat value as bare bucket name; default prefix = dags/
-            BUCKET="$raw"
-            PREFIX="$DEFAULT_PREFIX"
-          fi
-
-          # Basic validation
-          if [[ -z "$BUCKET" || "$BUCKET" == */* ]]; then
-            echo "ERROR: Invalid bucket spec. Provide 'gs://bucket[/prefix]' or just 'bucket'."
-            exit 1
-          fi
-
-          # Ensure bucket exists
-          if ! gsutil ls -b "gs://$BUCKET" >/dev/null 2>&1; then
-            echo "ERROR: Bucket gs://$BUCKET does not exist."
-            exit 1
-          fi
-
-          # Build destination (prefix may be empty)
-          if [[ -n "${PREFIX:-}" ]]; then
-            # normalize to end with a trailing slash
-            DEST="gs://$BUCKET/${PREFIX%/}/"
-          else
-            DEST="gs://$BUCKET/"
-          fi
-
-          echo "Uploading $LOCAL_DAG_PATH -> $DEST"
-          gsutil cp "$LOCAL_DAG_PATH" "$DEST"
-
+  # -------------------------------------------------------------------
+  # 1) Create bucket (idempotent) and seed top-level folders
+  # -------------------------------------------------------------------
   Bucket-Create-And-Seed:
     runs-on: ubuntu-latest
     steps:
@@ -79,129 +24,201 @@ jobs:
 
       # Install gcloud/gsutil
       - uses: google-github-actions/setup-gcloud@v2
+        with:
+          project_id: ${{ vars.GCP_PROJECT_ID }}
 
       - name: Create bucket (if needed) and folders
         env:
-          BUCKET_NAME: ${{ vars.BUCKET_NAME }}   # e.g. my-unique-bucket-name (NO gs://, NO slashes)
-          LOCATION: us-central1                  # change if needed
+          BUCKET_NAME: ${{ vars.BUCKET_NAME }}   # bare name, e.g. my-unique-bucket (NO gs://, NO slashes)
+          LOCATION: ${{ vars.BUCKET_LOCATION || 'us-central1' }}
         run: |
           set -euo pipefail
 
-          # Validate bucket name (must not include path segments)
-          if [[ "$BUCKET_NAME" == *"/"* ]]; then
-            echo "ERROR: BUCKET_NAME must be a bare name (no slashes). Given: '$BUCKET_NAME'"
+          if [[ -z "${BUCKET_NAME}" ]]; then
+            echo "ERROR: BUCKET_NAME repo variable is required."
+            exit 1
+          fi
+          if [[ "${BUCKET_NAME}" == *"/"* ]]; then
+            echo "ERROR: BUCKET_NAME must be a bare name (no slashes). Given: '${BUCKET_NAME}'"
             exit 1
           fi
 
           # Create the bucket if it doesn't exist (idempotent)
-          if ! gsutil ls -b "gs://$BUCKET_NAME" >/dev/null 2>&1; then
-            echo "Creating bucket gs://$BUCKET_NAME in $LOCATION"
-            gsutil mb -l "$LOCATION" "gs://$BUCKET_NAME"
+          if ! gsutil ls -b "gs://${BUCKET_NAME}" >/dev/null 2>&1; then
+            echo "Creating bucket gs://${BUCKET_NAME} in ${LOCATION}"
+            gsutil mb -l "${LOCATION}" "gs://${BUCKET_NAME}"
             # Optional hardening:
-            gsutil uniformbucketlevelaccess set on "gs://$BUCKET_NAME"
-            gsutil pap set enforced "gs://$BUCKET_NAME"   # public access prevention
+            gsutil uniformbucketlevelaccess set on "gs://${BUCKET_NAME}"
+            gsutil pap set enforced "gs://${BUCKET_NAME}"   # public access prevention
           else
-            echo "Bucket gs://$BUCKET_NAME already exists"
+            echo "Bucket gs://${BUCKET_NAME} already exists"
           fi
 
           # Create 5 top-level folders (prefixes), skip if they already exist
           FOLDERS=("data" "output" "source-dev" "source-prod" "spark-job")
           for dir in "${FOLDERS[@]}"; do
-            if ! gsutil ls -d "gs://$BUCKET_NAME/$dir/" >/dev/null 2>&1; then
-              echo "Creating folder gs://$BUCKET_NAME/$dir/"
-              gsutil mkdir "gs://$BUCKET_NAME/$dir"
+            if ! gsutil ls -d "gs://${BUCKET_NAME}/${dir}/" >/dev/null 2>&1; then
+              echo "Creating folder gs://${BUCKET_NAME}/${dir}/"
+              gsutil mkdir "gs://${BUCKET_NAME}/${dir}"
             else
-              echo "Folder gs://$BUCKET_NAME/$dir/ already exists"
+              echo "Folder gs://${BUCKET_NAME}/${dir}/ already exists"
             fi
           done
-  upload-to-dev:
-    if: github.ref == 'refs/heads/dev'
+
+  # -------------------------------------------------------------------
+  # 2) Deploy to Airflow in Composer: picks variables.json based on branch,
+  #    imports variables, and uploads your DAG to the Composer bucket/prefix.
+  # -------------------------------------------------------------------
+  Bucket-Airflow-Deploy:
+    needs: [Bucket-Create-And-Seed]
     runs-on: ubuntu-latest
-
     steps:
-      # Checkout the repository
-      - name: Checkout Code
-        uses: actions/checkout@v3
+      - uses: actions/checkout@v4
 
-      # Authenticate to GCP
-      - name: Authenticate to GCP
-        uses: google-github-actions/auth@v1
+      - id: auth
+        uses: google-github-actions/auth@v2
         with:
           credentials_json: ${{ secrets.GCP_SA_KEY }}
 
-      # Setup Google Cloud SDK
-      - name: Setup Google Cloud SDK
-        uses: google-github-actions/setup-gcloud@v1
+      - uses: google-github-actions/setup-gcloud@v2
         with:
-          project_id: ${{ secrets.GCP_PROJECT_ID }}
+          project_id: ${{ vars.GCP_PROJECT_ID }}
 
-      # Upload `variables.json` to Composer bucket
-      - name: Upload Variables JSON to GCS
-        run: |
-          gsutil cp variables/dev/variables.json gs://us-central1-airflow-flight--866ea176-bucket/data/dev/variables.json
+      - name: Upload variables.json then import, then upload DAG
+        env:
+          # Accepts either "gs://your-bucket/dags" OR just "your-bucket"
+          AIRFLOW_BUCKET_URL: ${{ vars.AIRFLOW_BUCKET_NAME }}
+          DEFAULT_PREFIX: dags
+          LOCAL_DAG_PATH: airflow_job/airflow_job.py
 
-      # Import Variables into Airflow-DEV
-      - name: Import Variables into Airflow-DEV
-        run: |
-          gcloud composer environments run airflow-dev \
-            --location us-central1 \
-            variables import -- /home/airflow/gcs/data/dev/variables.json
+          # Default single env; optionally override per-branch with the two below
+          COMPOSER_ENV_DEFAULT: ${{ vars.COMPOSER_ENV_NAME }}
+          COMPOSER_ENV_DEV: ${{ vars.COMPOSER_ENV_DEV_NAME }}
+          COMPOSER_ENV_PROD: ${{ vars.COMPOSER_ENV_PROD_NAME }}
+          COMPOSER_REGION: ${{ vars.COMPOSER_REGION }}
 
-      # Sync Spark job to GCS
-      - name: Upload Spark Job to GCS
+          # Branch name from GitHub (e.g., "dev" or "main")
+          BRANCH_NAME: ${{ github.ref_name }}
         run: |
-          gsutil cp spark_job/spark_transformation_job.py gs://airflow-flight-proj/spark-job/
+          set -euo pipefail
 
-      # Sync Airflow DAG to Airflow DEV Composer
-      - name: Upload Airflow DAG to DEV
+          # ---- decide environment (dev|prod) from branch ----
+          if [[ "${BRANCH_NAME}" == "main" ]]; then
+            ENV_SHORT="prod"
+            COMPOSER_ENV="${COMPOSER_ENV_PROD:-${COMPOSER_ENV_DEFAULT:-}}"
+          else
+            # everything else (incl. 'dev') routes to dev
+            ENV_SHORT="dev"
+            COMPOSER_ENV="${COMPOSER_ENV_DEV:-${COMPOSER_ENV_DEFAULT:-}}"
+          fi
+
+          if [[ -z "${COMPOSER_ENV:-}" || -z "${COMPOSER_REGION:-}" ]]; then
+            echo "ERROR: Set COMPOSER_ENV_NAME (or COMPOSER_ENV_DEV_NAME/COMPOSER_ENV_PROD_NAME) and COMPOSER_REGION repo vars."
+            exit 1
+          fi
+
+          # ---- pick correct variables.json path based on branch ----
+          LOCAL_VARS_PATH="variables/${ENV_SHORT}/variables.json"
+          if [[ ! -f "${LOCAL_VARS_PATH}" ]]; then
+            echo "ERROR: ${LOCAL_VARS_PATH} not found in repo."
+            exit 1
+          fi
+
+          # ---- parse AIRFLOW_BUCKET_URL into BUCKET and optional PREFIX ----
+          if [[ -z "${AIRFLOW_BUCKET_URL:-}" ]]; then
+            echo "ERROR: AIRFLOW_BUCKET_NAME repo var is required (either 'bucket' or 'gs://bucket[/prefix]')."
+            exit 1
+          fi
+
+          raw="${AIRFLOW_BUCKET_URL}"
+          if [[ "${raw}" == gs://* ]]; then
+            tmp="${raw#gs://}"
+            BUCKET="${tmp%%/*}"
+            rest="${tmp#*/}"
+            [[ "${rest}" == "${tmp}" ]] && PREFIX="" || PREFIX="${rest}"
+          else
+            BUCKET="${raw}"
+            PREFIX="${DEFAULT_PREFIX}"
+          fi
+
+          if [[ -z "${BUCKET}" || "${BUCKET}" == */* ]]; then
+            echo "ERROR: AIRFLOW_BUCKET_NAME must be a bare bucket or gs://bucket[/prefix]. Got: '${AIRFLOW_BUCKET_URL}'"
+            exit 1
+          fi
+          if ! gsutil ls -b "gs://${BUCKET}" >/dev/null 2>&1; then
+            echo "ERROR: Bucket gs://${BUCKET} does not exist."
+            exit 1
+          fi
+
+          # ---- 1) upload variables.json -> Composer data path ----
+          REMOTE_VARS_PATH="gs://${BUCKET}/data/${ENV_SHORT}/variables.json"
+          echo "Uploading variables: ${LOCAL_VARS_PATH} -> ${REMOTE_VARS_PATH}"
+          gsutil cp "${LOCAL_VARS_PATH}" "${REMOTE_VARS_PATH}"
+
+          # ---- 2) import variables into Airflow ----
+          echo "Importing Airflow variables into env '${COMPOSER_ENV}' (${COMPOSER_REGION}) for '${ENV_SHORT}'"
+          gcloud composer environments run "${COMPOSER_ENV}" \
+            --location "${COMPOSER_REGION}" \
+            variables -- \
+            --import "/home/airflow/gcs/data/${ENV_SHORT}/variables.json"
+
+          # ---- 3) upload DAG to the Composer DAGs folder ----
+          if [[ -n "${PREFIX:-}" ]]; then
+            DEST="gs://${BUCKET}/${PREFIX%/}/"
+          else
+            DEST="gs://${BUCKET}/"
+          fi
+          echo "Uploading DAG: ${LOCAL_DAG_PATH} -> ${DEST}"
+          gsutil cp "${LOCAL_DAG_PATH}" "${DEST}"
+
+  # -------------------------------------------------------------------
+  # 3) (Optional) Upload Spark job artifact to a bucket per branch
+  #     - You can remove these two jobs if you don’t need the Spark copy.
+  # -------------------------------------------------------------------
+  upload-to-dev:
+    if: github.ref == 'refs/heads/dev'
+    needs: [Bucket-Create-And-Seed]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Authenticate to GCP
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+      - name: Setup Google Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+        with:
+          project_id: ${{ vars.GCP_PROJECT_ID }}
+
+      - name: Upload Spark Job to GCS (dev)
+        env:
+          SPARK_BUCKET_NAME: ${{ vars.SPARK_BUCKET_NAME || vars.BUCKET_NAME }}
         run: |
-          gcloud composer environments storage dags import \
-            --environment airflow-dev \
-            --location us-central1 \
-            --source airflow_job/airflow_job.py
+          set -euo pipefail
+          gsutil cp spark_job/spark_transformation_job.py "gs://${SPARK_BUCKET_NAME}/spark-job/"
 
   upload-to-prod:
     if: github.ref == 'refs/heads/main'
+    needs: [Bucket-Create-And-Seed]
     runs-on: ubuntu-latest
-
     steps:
-      # Checkout the repository
-      - name: Checkout Code
-        uses: actions/checkout@v3
+      - uses: actions/checkout@v4
 
-      # Authenticate to GCP
       - name: Authenticate to GCP
-        uses: google-github-actions/auth@v1
+        uses: google-github-actions/auth@v2
         with:
           credentials_json: ${{ secrets.GCP_SA_KEY }}
 
-      # Setup Google Cloud SDK
       - name: Setup Google Cloud SDK
-        uses: google-github-actions/setup-gcloud@v1
+        uses: google-github-actions/setup-gcloud@v2
         with:
-          project_id: ${{ secrets.GCP_PROJECT_ID }}
+          project_id: ${{ vars.GCP_PROJECT_ID }}
 
-      # Upload `variables.json` to Composer bucket
-      - name: Upload Variables JSON to GCS
+      - name: Upload Spark Job to GCS (prod)
+        env:
+          SPARK_BUCKET_NAME: ${{ vars.SPARK_BUCKET_NAME || vars.BUCKET_NAME }}
         run: |
-          gsutil cp variables/prod/variables.json gs://us-central1-airflow-flight--866ea176-bucket/data/prod/variables.json
-
-      # Import Variables into Airflow-PROD
-      - name: Import Variables into Airflow-PROD
-        run: |
-          gcloud composer environments run airflow-prod \
-            --location us-central1 \
-            variables import -- /home/airflow/gcs/data/prod/variables.json
-
-      # Sync Spark job to GCS
-      - name: Upload Spark Job to GCS
-        run: |
-          gsutil cp spark_job/spark_transformation_job.py gs://airflow-flight-proj/spark-job/
-
-      # Sync Airflow DAG to Airflow PROD Composer
-      - name: Upload Airflow DAG to PROD
-        run: |
-          gcloud composer environments storage dags import \
-            --environment airflow-prod \
-            --location us-central1 \
-            --source airflow_job/airflow_job.py
+          set -euo pipefail
+          gsutil cp spark_job/spark_transformation_job.py "gs://${SPARK_BUCKET_NAME}/spark-job/"
