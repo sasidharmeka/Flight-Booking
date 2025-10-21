@@ -65,67 +65,110 @@ jobs:
             fi
           done
   Composer-Ensure-Env:
-    needs: [Bucket-Create-And-Seed]
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
+    
+    env:
+      REGION: ${{ vars.COMPOSER_REGION }}
+      ENV_DEV: ${{ vars.COMPOSER_ENV_DEV_NAME }}
+      ENV_PROD: ${{ vars.COMPOSER_ENV_PROD_NAME }}
+      ENV_SINGLE: ${{ vars.COMPOSER_ENV_NAME }}
+      IMAGE_VERSION: ${{ vars.COMPOSER_IMAGE_VERSION }}    # e.g., composer-2-airflow-2 or a pinned version
+      ENV_SA: ${{ vars.COMPOSER_ENV_SA }}                  # optional; if empty, we'll create/use composer-env-sa@<project>
+      COMPOSER_BUCKET: ${{ vars.COMPOSER_BUCKET }}         # optional; if set, Composer will use this bucket
+    run: |
+      set -euo pipefail
 
-      - name: Auth
-        uses: google-github-actions/auth@v2
-        with:
-          credentials_json: ${{ secrets.GCP_SA_KEY }}
+      # --- Resolve project + caller + region ---
+      : "${REGION:?Set COMPOSER_REGION}"
+      PROJECT_ID="$(gcloud config get-value project)"
+      PROJECT_NUMBER="$(gcloud projects describe "$PROJECT_ID" --format='value(projectNumber)')"
+      CALLER="$(gcloud auth list --filter=status:ACTIVE --format='value(account)')"
 
-      - name: Setup gcloud
-        uses: google-github-actions/setup-gcloud@v2
-        with:
-          project_id: ${{ vars.GCP_PROJECT_ID }}
+      # --- Pick env by branch (dev/main), else fallback to single-env ---
+      BRANCH="${GITHUB_REF_NAME}"
+      if [[ "$BRANCH" == "dev" && -n "${ENV_DEV:-}" ]]; then
+        ENV_NAME="$ENV_DEV"
+      elif [[ "$BRANCH" == "main" && -n "${ENV_PROD:-}" ]]; then
+        ENV_NAME="$ENV_PROD"
+      elif [[ -n "${ENV_SINGLE:-}" ]]; then
+        ENV_NAME="$ENV_SINGLE"
+      else
+        echo "ERROR: Set COMPOSER_ENV_DEV_NAME/COMPOSER_ENV_PROD_NAME (or COMPOSER_ENV_NAME)."
+        exit 1
+      fi
 
-      - name: Ensure Composer env (create if absent) and output bucket
-        id: ensure
-        env:
-          REGION: ${{ vars.COMPOSER_REGION }}
-          ENV_DEV: ${{ vars.COMPOSER_ENV_DEV_NAME }}
-          ENV_PROD: ${{ vars.COMPOSER_ENV_PROD_NAME }}
-          ENV_SINGLE: ${{ vars.COMPOSER_ENV_NAME }}   # optional single-env fallback
-          IMAGE_VERSION: ${{ vars.COMPOSER_IMAGE_VERSION }} # optional, e.g. composer-2.7.4-airflow-2.9.3
-        run: |
-          set -euo pipefail
+      echo "Project: $PROJECT_ID ($PROJECT_NUMBER)"
+      echo "Caller : $CALLER"
+      echo "Region : $REGION"
+      echo "Env    : $ENV_NAME"
 
-          BRANCH="${GITHUB_REF_NAME}"
-          if [[ "$BRANCH" == "dev" && -n "${ENV_DEV:-}" ]]; then
-            ENV_NAME="$ENV_DEV"
-          elif [[ "$BRANCH" == "main" && -n "${ENV_PROD:-}" ]]; then
-            ENV_NAME="$ENV_PROD"
-          elif [[ -n "${ENV_SINGLE:-}" ]]; then
-            ENV_NAME="$ENV_SINGLE"
-          else
-            echo "ERROR: Set COMPOSER_ENV_DEV_NAME/COMPOSER_ENV_PROD_NAME (or COMPOSER_ENV_NAME) and COMPOSER_REGION."
-            exit 1
-          fi
+      # --- Decide env SA email (use provided or default name) ---
+      if [[ -n "${ENV_SA:-}" ]]; then
+        ENV_SA_EMAIL="$ENV_SA"
+      else
+        ENV_SA_EMAIL="composer-env-sa@${PROJECT_ID}.iam.gserviceaccount.com"
+      fi
+      SA_NAME="${ENV_SA_EMAIL%%@*}"   # left of @
 
-          if ! gcloud composer environments describe "$ENV_NAME" --location "$REGION" >/dev/null 2>&1; then
-            echo "Creating Composer env: $ENV_NAME in $REGION"
-            CREATE_ARGS=( --location "$REGION" )
-            if [[ -n "${IMAGE_VERSION:-}" ]]; then
-              CREATE_ARGS+=( --image-version "$IMAGE_VERSION" )
-            fi
-            # Create a Composer 2 env (Autopilot by default). Add more flags if you need.
-            gcloud composer environments create "$ENV_NAME" "${CREATE_ARGS[@]}"
-          else
-            echo "Composer env $ENV_NAME already exists."
-          fi
+      echo "Environment SA: $ENV_SA_EMAIL"
 
-          BUCKET="$(gcloud composer environments describe "$ENV_NAME" --location "$REGION" --format='value(config.gcsBucket)')"
-          DAGS_PREFIX="$(gcloud composer environments describe "$ENV_NAME" --location "$REGION" --format='value(config.dagGcsPrefix)')"
-          AIRFLOW_URI="$(gcloud composer environments describe "$ENV_NAME" --location "$REGION" --format='value(config.airflowUri)')"
+      # --- Create env SA if it doesn't exist ---
+      if ! gcloud iam service-accounts describe "$ENV_SA_EMAIL" --project="$PROJECT_ID" >/dev/null 2>&1; then
+        echo "Creating service account: $SA_NAME"
+        gcloud iam service-accounts create "$SA_NAME" \
+          --display-name="Composer Environment SA" \
+          --project="$PROJECT_ID"
+      else
+        echo "Service account already exists."
+      fi
 
-          echo "bucket=$BUCKET" >> "$GITHUB_OUTPUT"
-          echo "dags_prefix=$DAGS_PREFIX" >> "$GITHUB_OUTPUT"
-          echo "airflow_uri=$AIRFLOW_URI" >> "$GITHUB_OUTPUT"
+      # --- Ensure IAM: env SA has composer.worker (minimum for Composer runtime) ---
+      gcloud projects add-iam-policy-binding "$PROJECT_ID" \
+        --member="serviceAccount:${ENV_SA_EMAIL}" \
+        --role="roles/composer.worker" >/dev/null
 
-          echo "Composer bucket: $BUCKET"
-          echo "DAGs prefix:     $DAGS_PREFIX"
-          echo "Airflow UI:      $AIRFLOW_URI"
+      # --- Ensure IAM: CI caller can create envs & act as env SA ---
+      # Note: CALLER is your GitHub Actions SA (from GCP_SA_KEY). This may already be granted; bindings are idempotent.
+      gcloud projects add-iam-policy-binding "$PROJECT_ID" \
+        --member="serviceAccount:${CALLER}" \
+        --role="roles/composer.admin" >/dev/null || true
+
+      gcloud iam service-accounts add-iam-policy-binding "$ENV_SA_EMAIL" \
+        --member="serviceAccount:${CALLER}" \
+        --role="roles/iam.serviceAccountUser" >/dev/null || true
+
+      # --- Ensure IAM: Composer service agent extension (one-time per project, safe to repeat) ---
+      COMPOSER_AGENT="service-${PROJECT_NUMBER}@cloudcomposer-accounts.iam.gserviceaccount.com"
+      gcloud projects add-iam-policy-binding "$PROJECT_ID" \
+        --member="serviceAccount:${COMPOSER_AGENT}" \
+        --role="roles/composer.ServiceAgentV2Ext" >/dev/null || true
+
+      # --- Create Composer env if absent (pass SA and optional bucket) ---
+      if ! gcloud composer environments describe "$ENV_NAME" --location "$REGION" >/dev/null 2>&1; then
+        echo "Creating Composer env: $ENV_NAME in $REGION"
+        CREATE_ARGS=( --location "$REGION" --service-account "$ENV_SA_EMAIL" )
+        if [[ -n "${IMAGE_VERSION:-}" ]]; then
+          CREATE_ARGS+=( --image-version "$IMAGE_VERSION" )
+        fi
+        if [[ -n "${COMPOSER_BUCKET:-}" ]]; then
+          CREATE_ARGS+=( --cloud-storage-bucket "$COMPOSER_BUCKET" )
+        fi
+        gcloud composer environments create "$ENV_NAME" "${CREATE_ARGS[@]}"
+      else
+        echo "Composer env $ENV_NAME already exists."
+      fi
+
+      # --- Discover outputs (works whether bucket was auto-created or provided) ---
+      BUCKET="$(gcloud composer environments describe "$ENV_NAME" --location "$REGION" --format='value(config.gcsBucket)')"
+      DAGS_PREFIX="$(gcloud composer environments describe "$ENV_NAME" --location "$REGION" --format='value(config.dagGcsPrefix)')"
+      AIRFLOW_URI="$(gcloud composer environments describe "$ENV_NAME" --location "$REGION" --format='value(config.airflowUri)')"
+
+      echo "bucket=$BUCKET" >> "$GITHUB_OUTPUT"
+      echo "dags_prefix=$DAGS_PREFIX" >> "$GITHUB_OUTPUT"
+      echo "airflow_uri=$AIRFLOW_URI" >> "$GITHUB_OUTPUT"
+
+      echo "Composer bucket: $BUCKET"
+      echo "DAGs prefix:     $DAGS_PREFIX"
+      echo "Airflow UI:      $AIRFLOW_URI"
 
   # -------------------------------------------------------------------
   # 2) Deploy to Airflow in Composer: picks variables.json based on branch,
@@ -133,26 +176,24 @@ jobs:
   # -------------------------------------------------------------------
   Bucket-Airflow-Deploy:
     needs: [Composer-Ensure-Env]
-
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
-      - id: auth
+      - name: Auth to GCP
         uses: google-github-actions/auth@v2
         with:
           credentials_json: ${{ secrets.GCP_SA_KEY }}
 
-      - uses: google-github-actions/setup-gcloud@v2
+      - name: Setup gcloud + gsutil
+        uses: google-github-actions/setup-gcloud@v2
         with:
           project_id: ${{ vars.GCP_PROJECT_ID }}
 
       - name: Resolve Composer bucket & upload variables + DAG
         env:
-          # Optional single-env fallback:
-          COMPOSER_ENV_NAME: ${{ vars.COMPOSER_ENV_NAME }}
-          # Branch-specific (recommended):
-          COMPOSER_ENV_DEV_NAME: ${{ vars.COMPOSER_ENV_DEV_NAME }}
+          COMPOSER_ENV_NAME: ${{ vars.COMPOSER_ENV_NAME }}         # single-env fallback
+          COMPOSER_ENV_DEV_NAME: ${{ vars.COMPOSER_ENV_DEV_NAME }} # branch-specific
           COMPOSER_ENV_PROD_NAME: ${{ vars.COMPOSER_ENV_PROD_NAME }}
           COMPOSER_REGION: ${{ vars.COMPOSER_REGION }}
 
@@ -163,7 +204,7 @@ jobs:
         run: |
           set -euo pipefail
 
-          # Pick env by branch, fallback to COMPOSER_ENV_NAME if only one env is used
+          # 1) Pick env by branch (dev/main), else fallback to single-env
           BRANCH="${GITHUB_REF_NAME}"
           if [[ "$BRANCH" == "dev" && -n "${COMPOSER_ENV_DEV_NAME:-}" ]]; then
             COMPOSER_ENV="$COMPOSER_ENV_DEV_NAME"
@@ -174,20 +215,47 @@ jobs:
             LOCAL_VARS_PATH="$LOCAL_VARS_PROD"
             VARS_SUBDIR="prod"
           else
-            # Single-env setup
-            if [[ -z "${COMPOSER_ENV_NAME:-}" ]]; then
-              echo "ERROR: Set COMPOSER_ENV_NAME (or COMPOSER_ENV_DEV_NAME/COMPOSER_ENV_PROD_NAME) and COMPOSER_REGION repo vars."
-              exit 1
-            fi
+            : "${COMPOSER_ENV_NAME:?Set COMPOSER_ENV_NAME (or branch-specific names)}"
             COMPOSER_ENV="$COMPOSER_ENV_NAME"
             LOCAL_VARS_PATH="$LOCAL_VARS_DEV"
             VARS_SUBDIR="dev"
           fi
 
-          if [[ -z "${COMPOSER_REGION:-}" ]]; then
-            echo "ERROR: COMPOSER_REGION repo variable is required."
-            exit 1
+          : "${COMPOSER_REGION:?Set COMPOSER_REGION}"
+
+          # 2) Discover bucket & DAGs prefix from the env (works whether you pre-set a bucket or not)
+          BUCKET="$(gcloud composer environments describe "$COMPOSER_ENV" \
+            --location "$COMPOSER_REGION" --format='value(config.gcsBucket)')"
+          DAGS_PREFIX="$(gcloud composer environments describe "$COMPOSER_ENV" \
+            --location "$COMPOSER_REGION" --format='value(config.dagGcsPrefix)')"
+
+          if [[ -z "${BUCKET}" || -z "${DAGS_PREFIX}" ]]; then
+            echo "Failed to resolve Composer bucket or DAGs prefix"; exit 1
           fi
+
+          echo "Composer bucket: ${BUCKET}"
+          echo "DAGs prefix:     ${DAGS_PREFIX}"
+
+          # 3) Upload DAG file to the env's DAGS folder
+          # DAGS_PREFIX is like: gs://<bucket>/dags
+          gsutil cp "${LOCAL_DAG_PATH}" "${DAGS_PREFIX}/"
+
+          # 4) Upload variables file into the env's data path
+          VARS_GCS="gs://${BUCKET}/data/variables/${VARS_SUBDIR}/variables.json"
+          gsutil cp "${LOCAL_VARS_PATH}" "${VARS_GCS}"
+
+          # 5) Import Airflow variables inside the Composer environment
+          # Path inside the scheduler container maps to /home/airflow/gcs/data/...
+          INSIDE_PATH="/home/airflow/gcs/data/variables/${VARS_SUBDIR}/variables.json"
+          gcloud composer environments run "$COMPOSER_ENV" \
+            --location "$COMPOSER_REGION" \
+            variables -- --import "${INSIDE_PATH}"
+
+          # Optional: show Airflow web UI URL
+          AIRFLOW_URI="$(gcloud composer environments describe "$COMPOSER_ENV" \
+            --location "$COMPOSER_REGION" --format='value(config.airflowUri)')"
+          echo "Airflow UI: ${AIRFLOW_URI}"
+
   # -------------------------------------------------------------------
   # 3) (Optional) Upload Spark job artifact to a bucket per branch
   #     - You can remove these two jobs if you don’t need the Spark copy.
