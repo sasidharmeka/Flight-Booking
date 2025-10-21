@@ -302,7 +302,7 @@ jobs:
 
 
   # -------------------------------------------------------------------
-  # 3) (Optional) Upload Spark job artifact to a bucket per branch
+  # 3) (Optional) Upload Spark job artifact to a bucket per branch.
   #     - You can remove these two jobs if you don’t need the Spark copy.
   # -------------------------------------------------------------------
   upload-to-dev:
