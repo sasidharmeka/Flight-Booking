@@ -54,14 +54,14 @@ jobs:
             echo "Bucket gs://${BUCKET_NAME} already exists"
           fi
 
-          # Create 5 top-level folders (prefixes), skip if they already exist
+          # Create 5 top-level prefixes if they don't already exist
           FOLDERS=("data" "output" "source-dev" "source-prod" "spark-job")
           for dir in "${FOLDERS[@]}"; do
             if ! gsutil ls -d "gs://${BUCKET_NAME}/${dir}/" >/dev/null 2>&1; then
-              echo "Creating folder gs://${BUCKET_NAME}/${dir}/"
-              gsutil mkdir "gs://${BUCKET_NAME}/${dir}"
+              echo "Creating prefix gs://${BUCKET_NAME}/${dir}/ (via placeholder)"
+              gsutil -h "Content-Type:text/plain" cp /dev/null "gs://${BUCKET_NAME}/${dir}/.gcskeep"
             else
-              echo "Folder gs://${BUCKET_NAME}/${dir}/ already exists"
+              echo "Prefix gs://${BUCKET_NAME}/${dir}/ already exists"
             fi
           done
 
