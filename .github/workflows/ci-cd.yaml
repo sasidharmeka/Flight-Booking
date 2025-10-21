@@ -65,110 +65,127 @@ jobs:
             fi
           done
   Composer-Ensure-Env:
+    needs: [Bucket-Create-And-Seed]
     runs-on: ubuntu-latest
-    env:
-      REGION: ${{ vars.COMPOSER_REGION }}
-      ENV_DEV: ${{ vars.COMPOSER_ENV_DEV_NAME }}
-      ENV_PROD: ${{ vars.COMPOSER_ENV_PROD_NAME }}
-      ENV_SINGLE: ${{ vars.COMPOSER_ENV_NAME }}
-      IMAGE_VERSION: ${{ vars.COMPOSER_IMAGE_VERSION }}    # e.g., composer-2-airflow-2 or a pinned version
-      ENV_SA: ${{ vars.COMPOSER_ENV_SA }}                  # optional; if empty, we'll create/use composer-env-sa@<project>
-      COMPOSER_BUCKET: ${{ vars.COMPOSER_BUCKET }}         # optional; if set, Composer will use this bucket
-    run: |
-      set -euo pipefail
 
-      # --- Resolve project + caller + region ---
-      : "${REGION:?Set COMPOSER_REGION}"
-      PROJECT_ID="$(gcloud config get-value project)"
-      PROJECT_NUMBER="$(gcloud projects describe "$PROJECT_ID" --format='value(projectNumber)')"
-      CALLER="$(gcloud auth list --filter=status:ACTIVE --format='value(account)')"
+    steps:
+      - uses: actions/checkout@v4
 
-      # --- Pick env by branch (dev/main), else fallback to single-env ---
-      BRANCH="${GITHUB_REF_NAME}"
-      if [[ "$BRANCH" == "dev" && -n "${ENV_DEV:-}" ]]; then
-        ENV_NAME="$ENV_DEV"
-      elif [[ "$BRANCH" == "main" && -n "${ENV_PROD:-}" ]]; then
-        ENV_NAME="$ENV_PROD"
-      elif [[ -n "${ENV_SINGLE:-}" ]]; then
-        ENV_NAME="$ENV_SINGLE"
-      else
-        echo "ERROR: Set COMPOSER_ENV_DEV_NAME/COMPOSER_ENV_PROD_NAME (or COMPOSER_ENV_NAME)."
-        exit 1
-      fi
+      - name: Auth
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
 
-      echo "Project: $PROJECT_ID ($PROJECT_NUMBER)"
-      echo "Caller : $CALLER"
-      echo "Region : $REGION"
-      echo "Env    : $ENV_NAME"
+      - name: Setup gcloud
+        uses: google-github-actions/setup-gcloud@v2
+        with:
+          project_id: ${{ vars.GCP_PROJECT_ID }}
 
-      # --- Decide env SA email (use provided or default name) ---
-      if [[ -n "${ENV_SA:-}" ]]; then
-        ENV_SA_EMAIL="$ENV_SA"
-      else
-        ENV_SA_EMAIL="composer-env-sa@${PROJECT_ID}.iam.gserviceaccount.com"
-      fi
-      SA_NAME="${ENV_SA_EMAIL%%@*}"   # left of @
+      - name: Ensure Composer env (create if absent), auto-create SA, grant IAM, and output bucket
+        id: ensure
+        env:
+          REGION: ${{ vars.COMPOSER_REGION }}
+          ENV_DEV: ${{ vars.COMPOSER_ENV_DEV_NAME }}
+          ENV_PROD: ${{ vars.COMPOSER_ENV_PROD_NAME }}
+          ENV_SINGLE: ${{ vars.COMPOSER_ENV_NAME }}
+          IMAGE_VERSION: ${{ vars.COMPOSER_IMAGE_VERSION }}    # e.g., composer-2-airflow-2 or a pinned version
+          ENV_SA: ${{ vars.COMPOSER_ENV_SA }}                  # optional; if empty, we'll create/use composer-env-sa@<project>
+          COMPOSER_BUCKET: ${{ vars.COMPOSER_BUCKET }}         # optional; if set, Composer will use this bucket
+        run: |
+          set -euo pipefail
 
-      echo "Environment SA: $ENV_SA_EMAIL"
+          # --- Resolve project + caller + region ---
+          : "${REGION:?Set COMPOSER_REGION}"
+          PROJECT_ID="$(gcloud config get-value project)"
+          PROJECT_NUMBER="$(gcloud projects describe "$PROJECT_ID" --format='value(projectNumber)')"
+          CALLER="$(gcloud auth list --filter=status:ACTIVE --format='value(account)')"
 
-      # --- Create env SA if it doesn't exist ---
-      if ! gcloud iam service-accounts describe "$ENV_SA_EMAIL" --project="$PROJECT_ID" >/dev/null 2>&1; then
-        echo "Creating service account: $SA_NAME"
-        gcloud iam service-accounts create "$SA_NAME" \
-          --display-name="Composer Environment SA" \
-          --project="$PROJECT_ID"
-      else
-        echo "Service account already exists."
-      fi
+          # --- Pick env by branch (dev/main), else fallback to single-env ---
+          BRANCH="${GITHUB_REF_NAME}"
+          if [[ "$BRANCH" == "dev" && -n "${ENV_DEV:-}" ]]; then
+            ENV_NAME="$ENV_DEV"
+          elif [[ "$BRANCH" == "main" && -n "${ENV_PROD:-}" ]]; then
+            ENV_NAME="$ENV_PROD"
+          elif [[ -n "${ENV_SINGLE:-}" ]]; then
+            ENV_NAME="$ENV_SINGLE"
+          else
+            echo "ERROR: Set COMPOSER_ENV_DEV_NAME/COMPOSER_ENV_PROD_NAME (or COMPOSER_ENV_NAME)."
+            exit 1
+          fi
 
-      # --- Ensure IAM: env SA has composer.worker (minimum for Composer runtime) ---
-      gcloud projects add-iam-policy-binding "$PROJECT_ID" \
-        --member="serviceAccount:${ENV_SA_EMAIL}" \
-        --role="roles/composer.worker" >/dev/null
+          echo "Project: $PROJECT_ID ($PROJECT_NUMBER)"
+          echo "Caller : $CALLER"
+          echo "Region : $REGION"
+          echo "Env    : $ENV_NAME"
 
-      # --- Ensure IAM: CI caller can create envs & act as env SA ---
-      # Note: CALLER is your GitHub Actions SA (from GCP_SA_KEY). This may already be granted; bindings are idempotent.
-      gcloud projects add-iam-policy-binding "$PROJECT_ID" \
-        --member="serviceAccount:${CALLER}" \
-        --role="roles/composer.admin" >/dev/null || true
+          # --- Decide env SA email (use provided or default name) ---
+          if [[ -n "${ENV_SA:-}" ]]; then
+            ENV_SA_EMAIL="$ENV_SA"
+          else
+            ENV_SA_EMAIL="composer-env-sa@${PROJECT_ID}.iam.gserviceaccount.com"
+          fi
+          SA_NAME="${ENV_SA_EMAIL%%@*}"   # left of @
+          echo "Environment SA: $ENV_SA_EMAIL"
 
-      gcloud iam service-accounts add-iam-policy-binding "$ENV_SA_EMAIL" \
-        --member="serviceAccount:${CALLER}" \
-        --role="roles/iam.serviceAccountUser" >/dev/null || true
+          # --- Create env SA if it doesn't exist ---
+          if ! gcloud iam service-accounts describe "$ENV_SA_EMAIL" --project="$PROJECT_ID" >/dev/null 2>&1; then
+            echo "Creating service account: $SA_NAME"
+            gcloud iam service-accounts create "$SA_NAME" \
+              --display-name="Composer Environment SA" \
+              --project="$PROJECT_ID"
+          else
+            echo "Service account already exists."
+          fi
 
-      # --- Ensure IAM: Composer service agent extension (one-time per project, safe to repeat) ---
-      COMPOSER_AGENT="service-${PROJECT_NUMBER}@cloudcomposer-accounts.iam.gserviceaccount.com"
-      gcloud projects add-iam-policy-binding "$PROJECT_ID" \
-        --member="serviceAccount:${COMPOSER_AGENT}" \
-        --role="roles/composer.ServiceAgentV2Ext" >/dev/null || true
+          # --- Ensure IAM: env SA has composer.worker (minimum for Composer runtime) ---
+          gcloud projects add-iam-policy-binding "$PROJECT_ID" \
+            --member="serviceAccount:${ENV_SA_EMAIL}" \
+            --role="roles/composer.worker" >/dev/null || true
 
-      # --- Create Composer env if absent (pass SA and optional bucket) ---
-      if ! gcloud composer environments describe "$ENV_NAME" --location "$REGION" >/dev/null 2>&1; then
-        echo "Creating Composer env: $ENV_NAME in $REGION"
-        CREATE_ARGS=( --location "$REGION" --service-account "$ENV_SA_EMAIL" )
-        if [[ -n "${IMAGE_VERSION:-}" ]]; then
-          CREATE_ARGS+=( --image-version "$IMAGE_VERSION" )
-        fi
-        if [[ -n "${COMPOSER_BUCKET:-}" ]]; then
-          CREATE_ARGS+=( --cloud-storage-bucket "$COMPOSER_BUCKET" )
-        fi
-        gcloud composer environments create "$ENV_NAME" "${CREATE_ARGS[@]}"
-      else
-        echo "Composer env $ENV_NAME already exists."
-      fi
+          # --- Ensure IAM: CI caller can create envs & act as env SA ---
+          # Note: CALLER is your GitHub Actions SA (from GCP_SA_KEY).
+          gcloud projects add-iam-policy-binding "$PROJECT_ID" \
+            --member="serviceAccount:${CALLER}" \
+            --role="roles/composer.admin" >/dev/null || true
 
-      # --- Discover outputs (works whether bucket was auto-created or provided) ---
-      BUCKET="$(gcloud composer environments describe "$ENV_NAME" --location "$REGION" --format='value(config.gcsBucket)')"
-      DAGS_PREFIX="$(gcloud composer environments describe "$ENV_NAME" --location "$REGION" --format='value(config.dagGcsPrefix)')"
-      AIRFLOW_URI="$(gcloud composer environments describe "$ENV_NAME" --location "$REGION" --format='value(config.airflowUri)')"
+          gcloud iam service-accounts add-iam-policy-binding "$ENV_SA_EMAIL" \
+            --member="serviceAccount:${CALLER}" \
+            --role="roles/iam.serviceAccountUser" >/dev/null || true
 
-      echo "bucket=$BUCKET" >> "$GITHUB_OUTPUT"
-      echo "dags_prefix=$DAGS_PREFIX" >> "$GITHUB_OUTPUT"
-      echo "airflow_uri=$AIRFLOW_URI" >> "$GITHUB_OUTPUT"
+          # --- Ensure IAM: Composer service agent extension (one-time per project, safe to repeat) ---
+          COMPOSER_AGENT="service-${PROJECT_NUMBER}@cloudcomposer-accounts.iam.gserviceaccount.com"
+          gcloud projects add-iam-policy-binding "$PROJECT_ID" \
+            --member="serviceAccount:${COMPOSER_AGENT}" \
+            --role="roles/composer.ServiceAgentV2Ext" >/dev/null || true
 
-      echo "Composer bucket: $BUCKET"
-      echo "DAGs prefix:     $DAGS_PREFIX"
-      echo "Airflow UI:      $AIRFLOW_URI"
+          # --- Create Composer env if absent (pass SA and optional bucket) ---
+          if ! gcloud composer environments describe "$ENV_NAME" --location "$REGION" >/dev/null 2>&1; then
+            echo "Creating Composer env: $ENV_NAME in $REGION"
+            CREATE_ARGS=( --location "$REGION" --service-account "$ENV_SA_EMAIL" )
+            if [[ -n "${IMAGE_VERSION:-}" ]]; then
+              CREATE_ARGS+=( --image-version "$IMAGE_VERSION" )
+            fi
+            if [[ -n "${COMPOSER_BUCKET:-}" ]]; then
+              CREATE_ARGS+=( --cloud-storage-bucket "$COMPOSER_BUCKET" )
+            fi
+            gcloud composer environments create "$ENV_NAME" "${CREATE_ARGS[@]}"
+          else
+            echo "Composer env $ENV_NAME already exists."
+          fi
+
+          # --- Discover outputs (works whether bucket was auto-created or provided) ---
+          BUCKET="$(gcloud composer environments describe "$ENV_NAME" --location "$REGION" --format='value(config.gcsBucket)')"
+          DAGS_PREFIX="$(gcloud composer environments describe "$ENV_NAME" --location "$REGION" --format='value(config.dagGcsPrefix)')"
+          AIRFLOW_URI="$(gcloud composer environments describe "$ENV_NAME" --location "$REGION" --format='value(config.airflowUri)')"
+
+          echo "bucket=$BUCKET" >> "$GITHUB_OUTPUT"
+          echo "dags_prefix=$DAGS_PREFIX" >> "$GITHUB_OUTPUT"
+          echo "airflow_uri=$AIRFLOW_URI" >> "$GITHUB_OUTPUT"
+
+          echo "Composer bucket: $BUCKET"
+          echo "DAGs prefix:     $DAGS_PREFIX"
+          echo "Airflow UI:      $AIRFLOW_URI"
+
 
   # -------------------------------------------------------------------
   # 2) Deploy to Airflow in Composer: picks variables.json based on branch,
