@@ -206,7 +206,7 @@ jobs:
         uses: google-github-actions/setup-gcloud@v2
         with:
           project_id: ${{ vars.GCP_PROJECT_ID }}
-      - name: Resolve Composer bucket & grant write on it to caller (Composer 3 safe)
+      - name: Resolve Composer env, bucket, and dags prefix
         env:
           COMPOSER_ENV_NAME: ${{ vars.COMPOSER_ENV_NAME }}
           COMPOSER_ENV_DEV_NAME: ${{ vars.COMPOSER_ENV_DEV_NAME }}
@@ -244,9 +244,8 @@ jobs:
           BUCKET_NAME="$(gcloud composer environments describe "${COMPOSER_ENV}" \
             --location "${COMPOSER_REGION}" --format='value(storageConfig.bucket)')"
           if [[ -z "${BUCKET_NAME}" ]]; then
-            # Derive from gs://<bucket>/dags
-            TMP="${DAGS_PREFIX#gs://}"          # strip scheme
-            BUCKET_NAME="${TMP%%/*}"            # take first path segment
+            TMP="${DAGS_PREFIX#gs://}"   # strip scheme
+            BUCKET_NAME="${TMP%%/*}"     # first path segment
           fi
           [[ -n "${BUCKET_NAME}" ]] || { echo "ERROR: Could not resolve bucket name"; exit 1; }
           BUCKET_URI="gs://${BUCKET_NAME}"
@@ -254,12 +253,16 @@ jobs:
           echo "Composer bucket URI: ${BUCKET_URI}"
           echo "DAGs prefix:         ${DAGS_PREFIX}"
 
-          # Grant write on the bucket to the calling SA
+          # Grant write on the bucket to the calling SA (use GCS URL, not bare name)
           CALLER="$(gcloud auth list --filter=status:ACTIVE --format='value(account)')"
-          echo "Granting roles/storage.objectAdmin on ${BUCKET_NAME} to ${CALLER}"
-          gcloud storage buckets add-iam-policy-binding "${BUCKET_NAME}" \
+          echo "Granting roles/storage.objectAdmin on ${BUCKET_URI} to ${CALLER}"
+          gcloud storage buckets add-iam-policy-binding "${BUCKET_URI}" \
             --member="serviceAccount:${CALLER}" \
             --role="roles/storage.objectAdmin" >/dev/null
+
+          # Optional: quick check
+          gcloud storage buckets get-iam-policy "${BUCKET_URI}" \
+            --format="flattened(bindings[].role,bindings[].members[])" | sed -n '1,10p' || true
 
           # Export for next steps
           echo "BUCKET_URI=${BUCKET_URI}"   >> $GITHUB_ENV
