@@ -206,7 +206,7 @@ jobs:
         uses: google-github-actions/setup-gcloud@v2
         with:
           project_id: ${{ vars.GCP_PROJECT_ID }}
-      - name: Resolve Composer bucket & grant write on it to caller (robust)
+      - name: Resolve Composer bucket & grant write on it to caller (Composer 3 safe)
         env:
           COMPOSER_ENV_NAME: ${{ vars.COMPOSER_ENV_NAME }}
           COMPOSER_ENV_DEV_NAME: ${{ vars.COMPOSER_ENV_DEV_NAME }}
@@ -216,11 +216,9 @@ jobs:
           set -euo pipefail
 
           BRANCH="${GITHUB_REF_NAME:-}"
-          echo "Branch: ${BRANCH}"
-          echo "Vars: COMPOSER_ENV_NAME='${COMPOSER_ENV_NAME:-}', DEV='${COMPOSER_ENV_DEV_NAME:-}', PROD='${COMPOSER_ENV_PROD_NAME:-}'"
           : "${COMPOSER_REGION:?Set COMPOSER_REGION}"
 
-          # 0) Pick env (dev/main) or fallback
+          # Pick env by branch or fallback
           if [[ "$BRANCH" == "dev" && -n "${COMPOSER_ENV_DEV_NAME:-}" ]]; then
             COMPOSER_ENV="$COMPOSER_ENV_DEV_NAME"
           elif [[ "$BRANCH" == "main" && -n "${COMPOSER_ENV_PROD_NAME:-}" ]]; then
@@ -228,72 +226,45 @@ jobs:
           elif [[ -n "${COMPOSER_ENV_NAME:-}" ]]; then
             COMPOSER_ENV="$COMPOSER_ENV_NAME"
           else
-            echo "ERROR: Not on 'dev' or 'main', and COMPOSER_ENV_NAME is unset. Set COMPOSER_ENV_NAME or run on dev/main."
-            exit 1
+            echo "ERROR: Not on dev/main and COMPOSER_ENV_NAME is unset."; exit 1
           fi
           echo "Using Composer env: ${COMPOSER_ENV}"
           echo "COMPOSER_ENV=${COMPOSER_ENV}" >> $GITHUB_ENV
 
-          # 1) Show what's in this region (helps catch name/region mismatches)
-          echo "Listing Composer envs in region ${COMPOSER_REGION}:"
-          gcloud composer environments list --locations "${COMPOSER_REGION}" || true
+          # Ensure env exists and is RUNNING (quick check)
+          STATE="$(gcloud composer environments describe "${COMPOSER_ENV}" --location "${COMPOSER_REGION}" --format='value(state)')"
+          [[ "${STATE}" == "RUNNING" ]] || { echo "ERROR: Env state is ${STATE}"; exit 1; }
 
-          # 2) Ensure env exists
-          if ! gcloud composer environments describe "${COMPOSER_ENV}" --location "${COMPOSER_REGION}" >/dev/null 2>&1; then
-            echo "ERROR: Composer env '${COMPOSER_ENV}' not found in region '${COMPOSER_REGION}'."
-            exit 1
+          # Get DAGS prefix (works in Composer 2 & 3)
+          DAGS_PREFIX="$(gcloud composer environments describe "${COMPOSER_ENV}" \
+            --location "${COMPOSER_REGION}" --format='value(config.dagGcsPrefix)')"
+          [[ -n "${DAGS_PREFIX}" ]] || { echo "ERROR: dagGcsPrefix is empty"; exit 1; }
+
+          # Get bucket for Composer 3 (storageConfig.bucket). If empty, derive from dagGcsPrefix.
+          BUCKET_NAME="$(gcloud composer environments describe "${COMPOSER_ENV}" \
+            --location "${COMPOSER_REGION}" --format='value(storageConfig.bucket)')"
+          if [[ -z "${BUCKET_NAME}" ]]; then
+            # Derive from gs://<bucket>/dags
+            TMP="${DAGS_PREFIX#gs://}"          # strip scheme
+            BUCKET_NAME="${TMP%%/*}"            # take first path segment
           fi
-
-          # 3) Wait for RUNNING (creation/update may still be finishing)
-          echo "Waiting for env to be RUNNING..."
-          for i in {1..60}; do   # up to ~10 minutes
-            STATE="$(gcloud composer environments describe "${COMPOSER_ENV}" --location "${COMPOSER_REGION}" --format='value(state)')"
-            echo "  attempt $i: state=${STATE:-<empty>}"
-            [[ "${STATE}" == "RUNNING" ]] && break
-            sleep 10
-          done
-          if [[ "${STATE:-}" != "RUNNING" ]]; then
-            echo "ERROR: Env state is '${STATE:-<empty>}' (expected RUNNING)."
-            exit 1
-          fi
-
-          # 4) Poll for bucket/prefix to appear (some fields can lag briefly)
-          echo "Resolving bucket and DAGs prefix..."
-          BUCKET_URI=""
-          DAGS_PREFIX=""
-          for i in {1..30}; do   # up to ~5 minutes
-            BUCKET_URI="$(gcloud composer environments describe "${COMPOSER_ENV}" \
-              --location "${COMPOSER_REGION}" --format='value(config.gcsBucket)')"
-            DAGS_PREFIX="$(gcloud composer environments describe "${COMPOSER_ENV}" \
-              --location "${COMPOSER_REGION}" --format='value(config.dagGcsPrefix)')"
-            if [[ -n "${BUCKET_URI}" && -n "${DAGS_PREFIX}" ]]; then
-              break
-            fi
-            echo "  attempt $i: bucket='${BUCKET_URI:-}', dags='${DAGS_PREFIX:-}'"
-            sleep 10
-          done
-
-          if [[ -z "${BUCKET_URI}" || -z "${DAGS_PREFIX}" ]]; then
-            echo "ERROR: Failed to resolve Composer bucket or DAGs prefix even after waiting."
-            echo "Debug dump:"
-            gcloud composer environments describe "${COMPOSER_ENV}" --location "${COMPOSER_REGION}" --format=json || true
-            exit 1
-          fi
+          [[ -n "${BUCKET_NAME}" ]] || { echo "ERROR: Could not resolve bucket name"; exit 1; }
+          BUCKET_URI="gs://${BUCKET_NAME}"
 
           echo "Composer bucket URI: ${BUCKET_URI}"
           echo "DAGs prefix:         ${DAGS_PREFIX}"
 
-          # 5) Grant bucket write to the caller SA
-          BUCKET_NAME="${BUCKET_URI#gs://}"
+          # Grant write on the bucket to the calling SA
           CALLER="$(gcloud auth list --filter=status:ACTIVE --format='value(account)')"
           echo "Granting roles/storage.objectAdmin on ${BUCKET_NAME} to ${CALLER}"
           gcloud storage buckets add-iam-policy-binding "${BUCKET_NAME}" \
             --member="serviceAccount:${CALLER}" \
             --role="roles/storage.objectAdmin" >/dev/null
 
-          # 6) Export for next steps
+          # Export for next steps
           echo "BUCKET_URI=${BUCKET_URI}"   >> $GITHUB_ENV
           echo "DAGS_PREFIX=${DAGS_PREFIX}" >> $GITHUB_ENV
+
 
 
       - name: Upload DAG + variables to Composer
