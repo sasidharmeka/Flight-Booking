@@ -65,7 +65,7 @@ jobs:
             fi
           done
   Composer-Ensure-Env:
-    
+    runs-on: ubuntu-latest
     env:
       REGION: ${{ vars.COMPOSER_REGION }}
       ENV_DEV: ${{ vars.COMPOSER_ENV_DEV_NAME }}
