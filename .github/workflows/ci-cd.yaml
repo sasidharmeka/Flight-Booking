@@ -270,7 +270,7 @@ jobs:
 
 
 
-      - name: Upload DAG + variables to Composer (no DAG changes; uses AIRFLOW_VAR_* envs)
+      - name: Upload DAG and Import Airflow Variables
         run: |
           set -euo pipefail
 
@@ -289,63 +289,79 @@ jobs:
           BRANCH="${GITHUB_REF_NAME:-}"
           if [[ "$BRANCH" == "dev" ]]; then
             LOCAL_VARS_PATH="$LOCAL_VARS_DEV"
+            VARS_SUBDIR="dev"
           elif [[ "$BRANCH" == "main" ]]; then
             LOCAL_VARS_PATH="$LOCAL_VARS_PROD"
+            VARS_SUBDIR="prod"
           else
             LOCAL_VARS_PATH="$LOCAL_VARS_DEV"
+            VARS_SUBDIR="dev"
           fi
 
           # Sanity
           : "${COMPOSER_REGION:?COMPOSER_REGION not set}"
           : "${COMPOSER_ENV:?COMPOSER_ENV not set}"
-          [[ -f "$LOCAL_DAG_PATH" ]]   || { echo "Missing $LOCAL_DAG_PATH"; exit 1; }
-          [[ -f "$LOCAL_VARS_PATH" ]]  || { echo "Missing $LOCAL_VARS_PATH"; exit 1; }
+          [[ -f "$LOCAL_DAG_PATH" ]]  || { echo "Missing $LOCAL_DAG_PATH"; exit 1; }
+          [[ -f "$LOCAL_VARS_PATH" ]] || { echo "Missing $LOCAL_VARS_PATH"; exit 1; }
           [[ -n "${DAGS_PREFIX:-}" && -n "${BUCKET_URI:-}" ]] || { echo "Missing bucket/prefix"; exit 1; }
 
           echo "Copying DAG to ${DAGS_PREFIX}/"
           gsutil cp "$LOCAL_DAG_PATH" "${DAGS_PREFIX}/"
 
-          # (Optional) also store the variables.json in GCS for audit/debug
-          VARS_SUBDIR=$([[ "$BRANCH" == "main" ]] && echo "prod" || echo "dev")
+          # (Optional) keep a copy of variables.json in GCS for audit/debug
           VARS_GCS="${BUCKET_URI}/data/variables/${VARS_SUBDIR}/variables.json"
           echo "Copying variables JSON to ${VARS_GCS}"
           gsutil cp "$LOCAL_VARS_PATH" "$VARS_GCS"
 
-          # === Core: set Airflow Variables via environment variables on the Composer env ===
-          # For each key in variables.json, set AIRFLOW_VAR_<KEY>=<json_value>
-          # This makes Variable.get("<key>") return that value at runtime with NO DAG changes.
+          # Export env vars so the Python block can read them
+          export COMPOSER_ENV COMPOSER_REGION LOCAL_VARS_PATH
+
           echo "Updating Composer environment variables as AIRFLOW_VAR_* ..."
           python3 - <<'PY'
           import json, os, subprocess, shlex, sys
-          env_name   = os.environ.get("COMPOSER_ENV")
-          region     = os.environ.get("COMPOSER_REGION")
-          vars_path  = os.environ.get("LOCAL_VARS_PATH")
+
+          env_name  = os.environ.get("COMPOSER_ENV")
+          region    = os.environ.get("COMPOSER_REGION")
+          vars_path = os.environ.get("LOCAL_VARS_PATH")
           if not all([env_name, region, vars_path]):
-              print("Missing COMPOSER_ENV/COMPOSER_REGION/LOCAL_VARS_PATH", file=sys.stderr); sys.exit(1)
-          data = json.load(open(vars_path, "r", encoding="utf-8"))
+              print("Missing COMPOSER_ENV/COMPOSER_REGION/LOCAL_VARS_PATH", file=sys.stderr)
+              sys.exit(1)
+
+          with open(vars_path, "r", encoding="utf-8") as f:
+              data = json.load(f)
 
           def to_env_key(k: str) -> str:
-              # Airflow reads env var AIRFLOW_VAR_<KEY> for Variable.get("<key>")
-              # We map key -> upper snake for env name; Variable.get uses the original key (usually snake_case).
-              return "AIRFLOW_VAR_" + "".join(c if (c.isalnum() or c=="_") else "_" for c in k.upper())
+              # Airflow picks up AIRFLOW_VAR_<KEY> as Variable("<key>") (key lowercased).
+              # Use uppercase + non-alnum -> underscore for the env var name.
+              key = "".join(c if (c.isalnum() or c=="_") else "_" for c in k.upper())
+              return "AIRFLOW_VAR_" + key
 
-          # Update one variable at a time to avoid comma/escaping issues
+          def escape_for_gcloud(val: str) -> str:
+              # gcloud parses comma-separated pairs; since we set ONE var per call,
+              # only newlines need removal. Keep JSON quotes.
+              return val.replace("\n", "")
+
           for k, v in data.items():
               env_key = to_env_key(k)
-              # Value is JSON-encoded so types survive (strings, numbers, dicts...)
+              # Keep JSON for type fidelity (Variable.get returns string; your DAG can json.loads if needed)
               val = json.dumps(v, ensure_ascii=False)
+              val = escape_for_gcloud(val)
               cmd = [
-                  "gcloud", "composer", "environments", "update", env_name,
+                  "gcloud","composer","environments","update",env_name,
                   "--location", region,
                   f"--update-env-variables={env_key}={val}"
               ]
               print(">>", " ".join(shlex.quote(x) for x in cmd))
-              # Run and stream output
-              proc = subprocess.run(cmd)
-              if proc.returncode != 0:
-                  print(f"Failed to set {env_key}", file=sys.stderr); sys.exit(proc.returncode)
+              rc = subprocess.call(cmd)
+              if rc != 0:
+                  print(f"Failed to set {env_key}", file=sys.stderr)
+                  sys.exit(rc)
+
           print("All AIRFLOW_VAR_* set successfully.")
-  
+          PY
+
+              echo "Done."
+
 
 
 
