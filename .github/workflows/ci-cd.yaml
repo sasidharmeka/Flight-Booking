@@ -206,72 +206,100 @@ jobs:
         uses: google-github-actions/setup-gcloud@v2
         with:
           project_id: ${{ vars.GCP_PROJECT_ID }}
-
-      - name: Resolve Composer bucket & upload variables + DAG
+      - name: Resolve Composer bucket & grant write on it to caller
         env:
-          COMPOSER_ENV_NAME: ${{ vars.COMPOSER_ENV_NAME }}         # single-env fallback
-          COMPOSER_ENV_DEV_NAME: ${{ vars.COMPOSER_ENV_DEV_NAME }} # branch-specific
+          COMPOSER_ENV_NAME: ${{ vars.COMPOSER_ENV_NAME }}
+          COMPOSER_ENV_DEV_NAME: ${{ vars.COMPOSER_ENV_DEV_NAME }}
           COMPOSER_ENV_PROD_NAME: ${{ vars.COMPOSER_ENV_PROD_NAME }}
           COMPOSER_REGION: ${{ vars.COMPOSER_REGION }}
+        run: |
+          set -euo pipefail
 
-          # Your repo paths
+          # Pick env by branch (same logic as before)
+          BRANCH="${GITHUB_REF_NAME}"
+          if [[ "$BRANCH" == "dev" && -n "${COMPOSER_ENV_DEV_NAME:-}" ]]; then
+            COMPOSER_ENV="$COMPOSER_ENV_DEV_NAME"
+          elif [[ "$BRANCH" == "main" && -n "${COMPOSER_ENV_PROD_NAME:-}" ]]; then
+            COMPOSER_ENV="$COMPOSER_ENV_PROD_NAME"
+          else
+            : "${COMPOSER_ENV_NAME:?Set COMPOSER_ENV_NAME (or branch-specific names)}"
+            COMPOSER_ENV="$COMPOSER_ENV_NAME"
+          fi
+
+          : "${COMPOSER_REGION:?Set COMPOSER_REGION}"
+
+          # Discover bucket & dags prefix
+          BUCKET_URI="$(gcloud composer environments describe "$COMPOSER_ENV" \
+            --location "$COMPOSER_REGION" --format='value(config.gcsBucket)')"
+          DAGS_PREFIX="$(gcloud composer environments describe "$COMPOSER_ENV" \
+            --location "$COMPOSER_REGION" --format='value(config.dagGcsPrefix)')"
+
+          if [[ -z "$BUCKET_URI" || -z "$DAGS_PREFIX" ]]; then
+            echo "ERROR: Failed to resolve Composer bucket or DAGs prefix"; exit 1
+          fi
+
+          echo "Composer bucket URI: $BUCKET_URI"
+          echo "DAGs prefix:         $DAGS_PREFIX"
+
+          # Extract bucket name (strip gs://)
+          BUCKET_NAME="${BUCKET_URI#gs://}"
+
+          # The caller SA (from the github secret credentials)
+          CALLER="$(gcloud auth list --filter=status:ACTIVE --format='value(account)')"
+          echo "Granting storage.objectAdmin on ${BUCKET_NAME} to ${CALLER}"
+
+          # Grant bucket-level write (idempotent)
+          gcloud storage buckets add-iam-policy-binding "$BUCKET_NAME" \
+            --member="serviceAccount:${CALLER}" \
+            --role="roles/storage.objectAdmin" >/dev/null
+
+          # Small wait to avoid eventual consistency edge-cases
+          for i in {1..6}; do
+            if gsutil ls -b "gs://${BUCKET_NAME}" >/dev/null 2>&1; then
+              break
+            fi
+            sleep 5
+          done
+
+          # Export for next steps
+          echo "BUCKET_URI=$BUCKET_URI" >> $GITHUB_ENV
+          echo "DAGS_PREFIX=$DAGS_PREFIX" >> $GITHUB_ENV
+
+      - name: Upload DAG + variables to Composer
+        env:
           LOCAL_DAG_PATH: airflow_job/airflow_job.py
           LOCAL_VARS_DEV: variables/dev/variables.json
           LOCAL_VARS_PROD: variables/prod/variables.json
         run: |
           set -euo pipefail
 
-          # 1) Pick env by branch (dev/main), else fallback to single-env
+          # Choose variables file by branch (same logic you had)
           BRANCH="${GITHUB_REF_NAME}"
-          if [[ "$BRANCH" == "dev" && -n "${COMPOSER_ENV_DEV_NAME:-}" ]]; then
-            COMPOSER_ENV="$COMPOSER_ENV_DEV_NAME"
-            LOCAL_VARS_PATH="$LOCAL_VARS_DEV"
-            VARS_SUBDIR="dev"
-          elif [[ "$BRANCH" == "main" && -n "${COMPOSER_ENV_PROD_NAME:-}" ]]; then
-            COMPOSER_ENV="$COMPOSER_ENV_PROD_NAME"
-            LOCAL_VARS_PATH="$LOCAL_VARS_PROD"
-            VARS_SUBDIR="prod"
+          if [[ "$BRANCH" == "dev" ]]; then
+            LOCAL_VARS_PATH="$LOCAL_VARS_DEV"; VARS_SUBDIR="dev"
+          elif [[ "$BRANCH" == "main" ]]; then
+            LOCAL_VARS_PATH="$LOCAL_VARS_PROD"; VARS_SUBDIR="prod"
           else
-            : "${COMPOSER_ENV_NAME:?Set COMPOSER_ENV_NAME (or branch-specific names)}"
-            COMPOSER_ENV="$COMPOSER_ENV_NAME"
-            LOCAL_VARS_PATH="$LOCAL_VARS_DEV"
-            VARS_SUBDIR="dev"
+            LOCAL_VARS_PATH="$LOCAL_VARS_DEV"; VARS_SUBDIR="dev"
           fi
 
-          : "${COMPOSER_REGION:?Set COMPOSER_REGION}"
+          # Sanity checks
+          [[ -f "$LOCAL_DAG_PATH" ]] || { echo "Missing $LOCAL_DAG_PATH"; exit 1; }
+          [[ -n "${DAGS_PREFIX:-}" && -n "${BUCKET_URI:-}" ]] || { echo "Missing bucket/prefix"; exit 1; }
 
-          # 2) Discover bucket & DAGs prefix from the env (works whether you pre-set a bucket or not)
-          BUCKET="$(gcloud composer environments describe "$COMPOSER_ENV" \
-            --location "$COMPOSER_REGION" --format='value(config.gcsBucket)')"
-          DAGS_PREFIX="$(gcloud composer environments describe "$COMPOSER_ENV" \
-            --location "$COMPOSER_REGION" --format='value(config.dagGcsPrefix)')"
+          echo "Copying DAG to ${DAGS_PREFIX}/"
+          gsutil cp "$LOCAL_DAG_PATH" "${DAGS_PREFIX}/"
 
-          if [[ -z "${BUCKET}" || -z "${DAGS_PREFIX}" ]]; then
-            echo "Failed to resolve Composer bucket or DAGs prefix"; exit 1
-          fi
+          VARS_GCS="${BUCKET_URI}/data/variables/${VARS_SUBDIR}/variables.json"
+          echo "Copying variables to ${VARS_GCS}"
+          gsutil cp "$LOCAL_VARS_PATH" "$VARS_GCS"
 
-          echo "Composer bucket: ${BUCKET}"
-          echo "DAGs prefix:     ${DAGS_PREFIX}"
-
-          # 3) Upload DAG file to the env's DAGS folder
-          # DAGS_PREFIX is like: gs://<bucket>/dags
-          gsutil cp "${LOCAL_DAG_PATH}" "${DAGS_PREFIX}/"
-
-          # 4) Upload variables file into the env's data path
-          VARS_GCS="gs://${BUCKET}/data/variables/${VARS_SUBDIR}/variables.json"
-          gsutil cp "${LOCAL_VARS_PATH}" "${VARS_GCS}"
-
-          # 5) Import Airflow variables inside the Composer environment
-          # Path inside the scheduler container maps to /home/airflow/gcs/data/...
           INSIDE_PATH="/home/airflow/gcs/data/variables/${VARS_SUBDIR}/variables.json"
+          echo "Importing Airflow variables from ${INSIDE_PATH}"
           gcloud composer environments run "$COMPOSER_ENV" \
             --location "$COMPOSER_REGION" \
             variables -- --import "${INSIDE_PATH}"
 
-          # Optional: show Airflow web UI URL
-          AIRFLOW_URI="$(gcloud composer environments describe "$COMPOSER_ENV" \
-            --location "$COMPOSER_REGION" --format='value(config.airflowUri)')"
-          echo "Airflow UI: ${AIRFLOW_URI}"
 
   # -------------------------------------------------------------------
   # 3) (Optional) Upload Spark job artifact to a bucket per branch
