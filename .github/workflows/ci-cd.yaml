@@ -270,7 +270,7 @@ jobs:
 
 
 
-      - name: Upload DAG and Import Airflow Variables
+      - name: Upload DAG + variables (fast, single update; skips if unchanged)
         run: |
           set -euo pipefail
 
@@ -308,59 +308,77 @@ jobs:
           echo "Copying DAG to ${DAGS_PREFIX}/"
           gsutil cp "$LOCAL_DAG_PATH" "${DAGS_PREFIX}/"
 
-          # (Optional) keep a copy of variables.json in GCS for audit/debug
+          # Keep a copy of variables.json in GCS (optional, handy for audit)
           VARS_GCS="${BUCKET_URI}/data/variables/${VARS_SUBDIR}/variables.json"
           echo "Copying variables JSON to ${VARS_GCS}"
           gsutil cp "$LOCAL_VARS_PATH" "$VARS_GCS"
 
-          # Export env vars so the Python block can read them
-          export COMPOSER_ENV COMPOSER_REGION LOCAL_VARS_PATH
+          # Export for Python
+          export COMPOSER_ENV COMPOSER_REGION LOCAL_VARS_PATH VARS_SUBDIR
 
-          echo "Updating Composer environment variables as AIRFLOW_VAR_* ..."
           python3 - <<'PY'
-          import json, os, subprocess, shlex, sys
+          import json, os, subprocess, shlex, sys, hashlib, tempfile
 
-          env_name  = os.environ.get("COMPOSER_ENV")
-          region    = os.environ.get("COMPOSER_REGION")
-          vars_path = os.environ.get("LOCAL_VARS_PATH")
-          if not all([env_name, region, vars_path]):
-              print("Missing COMPOSER_ENV/COMPOSER_REGION/LOCAL_VARS_PATH", file=sys.stderr)
-              sys.exit(1)
+          env_name  = os.environ["COMPOSER_ENV"]
+          region    = os.environ["COMPOSER_REGION"]
+          vars_path = os.environ["LOCAL_VARS_PATH"]
 
-          with open(vars_path, "r", encoding="utf-8") as f:
-              data = json.load(f)
+          # 1) Load variables.json and compute a content hash
+          with open(vars_path, "rb") as f:
+              raw = f.read()
+          md5 = hashlib.md5(raw).hexdigest()
+          vars_hash_key = "AIRFLOW_VAR__VARS_HASH"
 
-          def to_env_key(k: str) -> str:
-              # Airflow picks up AIRFLOW_VAR_<KEY> as Variable("<key>") (key lowercased).
-              # Use uppercase + non-alnum -> underscore for the env var name.
-              key = "".join(c if (c.isalnum() or c=="_") else "_" for c in k.upper())
-              return "AIRFLOW_VAR_" + key
+          # 2) See if the same hash is already set on the environment → skip if unchanged
+          desc = subprocess.run(
+              ["gcloud","composer","environments","describe",env_name,"--location",region,"--format=json"],
+              capture_output=True, text=True
+          )
+          if desc.returncode != 0:
+              print("Failed to describe Composer env.", file=sys.stderr)
+              sys.exit(desc.returncode)
 
-          def escape_for_gcloud(val: str) -> str:
-              # gcloud parses comma-separated pairs; since we set ONE var per call,
-              # only newlines need removal. Keep JSON quotes.
-              return val.replace("\n", "")
+          try:
+              import json as _json
+              j = _json.loads(desc.stdout)
+              env_vars = (j.get("config",{})
+                            .get("softwareConfig",{})
+                            .get("envVariables",{}))
+          except Exception as e:
+              env_vars = {}
 
+          if env_vars.get(vars_hash_key) == md5:
+              print("Variables unchanged (hash match). Skipping Composer update.")
+              sys.exit(0)
+
+          # 3) Build one --update-env-variables arg with a custom delimiter (^|^)
+          data = json.loads(raw.decode("utf-8"))
+          def key_to_env(k: str) -> str:
+              return "AIRFLOW_VAR_" + "".join(c if (c.isalnum() or c=="_") else "_" for c in k.upper())
+
+          pairs = []
           for k, v in data.items():
-              env_key = to_env_key(k)
-              # Keep JSON for type fidelity (Variable.get returns string; your DAG can json.loads if needed)
-              val = json.dumps(v, ensure_ascii=False)
-              val = escape_for_gcloud(val)
-              cmd = [
-                  "gcloud","composer","environments","update",env_name,
-                  "--location", region,
-                  f"--update-env-variables={env_key}={val}"
-              ]
-              print(">>", " ".join(shlex.quote(x) for x in cmd))
-              rc = subprocess.call(cmd)
-              if rc != 0:
-                  print(f"Failed to set {env_key}", file=sys.stderr)
-                  sys.exit(rc)
+              env_key = key_to_env(k)
+              val = json.dumps(v, ensure_ascii=False)  # keep JSON string
+              val = val.replace("|", r"\|")            # escape our delimiter
+              pairs.append(f"{env_key}={val}")
 
-          print("All AIRFLOW_VAR_* set successfully.")
+          # Add/update the content hash as well
+          pairs.append(f"{vars_hash_key}={md5}")
+
+          # Construct single update command
+          arg_value = "^|^" + "|".join(pairs)
+          cmd = [
+              "gcloud","composer","environments","update",env_name,
+              "--location",region,
+              f"--update-env-variables={arg_value}"
+          ]
+          print(">>", " ".join(shlex.quote(x) for x in cmd))
+          rc = subprocess.call(cmd)
+          sys.exit(rc)
           PY
 
-              echo "Done."
+              echo "Done. (If an update was needed, Composer components restart once.)"
 
 
 
