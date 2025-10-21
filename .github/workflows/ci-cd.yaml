@@ -64,13 +64,76 @@ jobs:
               echo "Prefix gs://${BUCKET_NAME}/${dir}/ already exists"
             fi
           done
+    Composer-Ensure-Env:
+      needs: [Bucket-Create-And-Seed]
+      runs-on: ubuntu-latest
+      steps:
+        - uses: actions/checkout@v4
+
+        - name: Auth
+          uses: google-github-actions/auth@v2
+          with:
+            credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+        - name: Setup gcloud
+          uses: google-github-actions/setup-gcloud@v2
+          with:
+            project_id: ${{ vars.GCP_PROJECT_ID }}
+
+        - name: Ensure Composer env (create if absent) and output bucket
+          id: ensure
+          env:
+            REGION: ${{ vars.COMPOSER_REGION }}
+            ENV_DEV: ${{ vars.COMPOSER_ENV_DEV_NAME }}
+            ENV_PROD: ${{ vars.COMPOSER_ENV_PROD_NAME }}
+            ENV_SINGLE: ${{ vars.COMPOSER_ENV_NAME }}   # optional single-env fallback
+            IMAGE_VERSION: ${{ vars.COMPOSER_IMAGE_VERSION }} # optional, e.g. composer-2.7.4-airflow-2.9.3
+          run: |
+            set -euo pipefail
+
+            BRANCH="${GITHUB_REF_NAME}"
+            if [[ "$BRANCH" == "dev" && -n "${ENV_DEV:-}" ]]; then
+              ENV_NAME="$ENV_DEV"
+            elif [[ "$BRANCH" == "main" && -n "${ENV_PROD:-}" ]]; then
+              ENV_NAME="$ENV_PROD"
+            elif [[ -n "${ENV_SINGLE:-}" ]]; then
+              ENV_NAME="$ENV_SINGLE"
+            else
+              echo "ERROR: Set COMPOSER_ENV_DEV_NAME/COMPOSER_ENV_PROD_NAME (or COMPOSER_ENV_NAME) and COMPOSER_REGION."
+              exit 1
+            fi
+
+            if ! gcloud composer environments describe "$ENV_NAME" --location "$REGION" >/dev/null 2>&1; then
+              echo "Creating Composer env: $ENV_NAME in $REGION"
+              CREATE_ARGS=( --location "$REGION" )
+              if [[ -n "${IMAGE_VERSION:-}" ]]; then
+                CREATE_ARGS+=( --image-version "$IMAGE_VERSION" )
+              fi
+              # Create a Composer 2 env (Autopilot by default). Add more flags if you need.
+              gcloud composer environments create "$ENV_NAME" "${CREATE_ARGS[@]}"
+            else
+              echo "Composer env $ENV_NAME already exists."
+            fi
+
+            BUCKET="$(gcloud composer environments describe "$ENV_NAME" --location "$REGION" --format='value(config.gcsBucket)')"
+            DAGS_PREFIX="$(gcloud composer environments describe "$ENV_NAME" --location "$REGION" --format='value(config.dagGcsPrefix)')"
+            AIRFLOW_URI="$(gcloud composer environments describe "$ENV_NAME" --location "$REGION" --format='value(config.airflowUri)')"
+
+            echo "bucket=$BUCKET" >> "$GITHUB_OUTPUT"
+            echo "dags_prefix=$DAGS_PREFIX" >> "$GITHUB_OUTPUT"
+            echo "airflow_uri=$AIRFLOW_URI" >> "$GITHUB_OUTPUT"
+
+            echo "Composer bucket: $BUCKET"
+            echo "DAGs prefix:     $DAGS_PREFIX"
+            echo "Airflow UI:      $AIRFLOW_URI"
 
   # -------------------------------------------------------------------
   # 2) Deploy to Airflow in Composer: picks variables.json based on branch,
   #    imports variables, and uploads your DAG to the Composer bucket/prefix.
   # -------------------------------------------------------------------
   Bucket-Airflow-Deploy:
-    needs: [Bucket-Create-And-Seed]
+    needs: [Composer-Ensure-Env]
+
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
