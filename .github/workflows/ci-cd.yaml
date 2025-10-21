@@ -84,93 +84,47 @@ jobs:
         with:
           project_id: ${{ vars.GCP_PROJECT_ID }}
 
-      - name: Upload variables.json then import, then upload DAG
+      - name: Resolve Composer bucket & upload variables + DAG
         env:
-          # Accepts either "gs://your-bucket/dags" OR just "your-bucket"
-          AIRFLOW_BUCKET_URL: ${{ vars.AIRFLOW_BUCKET_NAME }}
-          DEFAULT_PREFIX: dags
-          LOCAL_DAG_PATH: airflow_job/airflow_job.py
-
-          # Default single env; optionally override per-branch with the two below
-          COMPOSER_ENV_DEFAULT: ${{ vars.COMPOSER_ENV_NAME }}
-          COMPOSER_ENV_DEV: ${{ vars.COMPOSER_ENV_DEV_NAME }}
-          COMPOSER_ENV_PROD: ${{ vars.COMPOSER_ENV_PROD_NAME }}
+          # Optional single-env fallback:
+          COMPOSER_ENV_NAME: ${{ vars.COMPOSER_ENV_NAME }}
+          # Branch-specific (recommended):
+          COMPOSER_ENV_DEV_NAME: ${{ vars.COMPOSER_ENV_DEV_NAME }}
+          COMPOSER_ENV_PROD_NAME: ${{ vars.COMPOSER_ENV_PROD_NAME }}
           COMPOSER_REGION: ${{ vars.COMPOSER_REGION }}
 
-          # Branch name from GitHub (e.g., "dev" or "main")
-          BRANCH_NAME: ${{ github.ref_name }}
+          # Your repo paths
+          LOCAL_DAG_PATH: airflow_job/airflow_job.py
+          LOCAL_VARS_DEV: variables/dev/variables.json
+          LOCAL_VARS_PROD: variables/prod/variables.json
         run: |
           set -euo pipefail
 
-          # ---- decide environment (dev|prod) from branch ----
-          if [[ "${BRANCH_NAME}" == "main" ]]; then
-            ENV_SHORT="prod"
-            COMPOSER_ENV="${COMPOSER_ENV_PROD:-${COMPOSER_ENV_DEFAULT:-}}"
+          # Pick env by branch, fallback to COMPOSER_ENV_NAME if only one env is used
+          BRANCH="${GITHUB_REF_NAME}"
+          if [[ "$BRANCH" == "dev" && -n "${COMPOSER_ENV_DEV_NAME:-}" ]]; then
+            COMPOSER_ENV="$COMPOSER_ENV_DEV_NAME"
+            LOCAL_VARS_PATH="$LOCAL_VARS_DEV"
+            VARS_SUBDIR="dev"
+          elif [[ "$BRANCH" == "main" && -n "${COMPOSER_ENV_PROD_NAME:-}" ]]; then
+            COMPOSER_ENV="$COMPOSER_ENV_PROD_NAME"
+            LOCAL_VARS_PATH="$LOCAL_VARS_PROD"
+            VARS_SUBDIR="prod"
           else
-            # everything else (incl. 'dev') routes to dev
-            ENV_SHORT="dev"
-            COMPOSER_ENV="${COMPOSER_ENV_DEV:-${COMPOSER_ENV_DEFAULT:-}}"
+            # Single-env setup
+            if [[ -z "${COMPOSER_ENV_NAME:-}" ]]; then
+              echo "ERROR: Set COMPOSER_ENV_NAME (or COMPOSER_ENV_DEV_NAME/COMPOSER_ENV_PROD_NAME) and COMPOSER_REGION repo vars."
+              exit 1
+            fi
+            COMPOSER_ENV="$COMPOSER_ENV_NAME"
+            LOCAL_VARS_PATH="$LOCAL_VARS_DEV"
+            VARS_SUBDIR="dev"
           fi
 
-          if [[ -z "${COMPOSER_ENV:-}" || -z "${COMPOSER_REGION:-}" ]]; then
-            echo "ERROR: Set COMPOSER_ENV_NAME (or COMPOSER_ENV_DEV_NAME/COMPOSER_ENV_PROD_NAME) and COMPOSER_REGION repo vars."
+          if [[ -z "${COMPOSER_REGION:-}" ]]; then
+            echo "ERROR: COMPOSER_REGION repo variable is required."
             exit 1
           fi
-
-          # ---- pick correct variables.json path based on branch ----
-          LOCAL_VARS_PATH="variables/${ENV_SHORT}/variables.json"
-          if [[ ! -f "${LOCAL_VARS_PATH}" ]]; then
-            echo "ERROR: ${LOCAL_VARS_PATH} not found in repo."
-            exit 1
-          fi
-
-          # ---- parse AIRFLOW_BUCKET_URL into BUCKET and optional PREFIX ----
-          if [[ -z "${AIRFLOW_BUCKET_URL:-}" ]]; then
-            echo "ERROR: AIRFLOW_BUCKET_NAME repo var is required (either 'bucket' or 'gs://bucket[/prefix]')."
-            exit 1
-          fi
-
-          raw="${AIRFLOW_BUCKET_URL}"
-          if [[ "${raw}" == gs://* ]]; then
-            tmp="${raw#gs://}"
-            BUCKET="${tmp%%/*}"
-            rest="${tmp#*/}"
-            [[ "${rest}" == "${tmp}" ]] && PREFIX="" || PREFIX="${rest}"
-          else
-            BUCKET="${raw}"
-            PREFIX="${DEFAULT_PREFIX}"
-          fi
-
-          if [[ -z "${BUCKET}" || "${BUCKET}" == */* ]]; then
-            echo "ERROR: AIRFLOW_BUCKET_NAME must be a bare bucket or gs://bucket[/prefix]. Got: '${AIRFLOW_BUCKET_URL}'"
-            exit 1
-          fi
-          if ! gsutil ls -b "gs://${BUCKET}" >/dev/null 2>&1; then
-            echo "ERROR: Bucket gs://${BUCKET} does not exist."
-            exit 1
-          fi
-
-          # ---- 1) upload variables.json -> Composer data path ----
-          REMOTE_VARS_PATH="gs://${BUCKET}/data/${ENV_SHORT}/variables.json"
-          echo "Uploading variables: ${LOCAL_VARS_PATH} -> ${REMOTE_VARS_PATH}"
-          gsutil cp "${LOCAL_VARS_PATH}" "${REMOTE_VARS_PATH}"
-
-          # ---- 2) import variables into Airflow ----
-          echo "Importing Airflow variables into env '${COMPOSER_ENV}' (${COMPOSER_REGION}) for '${ENV_SHORT}'"
-          gcloud composer environments run "${COMPOSER_ENV}" \
-            --location "${COMPOSER_REGION}" \
-            variables -- \
-            --import "/home/airflow/gcs/data/${ENV_SHORT}/variables.json"
-
-          # ---- 3) upload DAG to the Composer DAGs folder ----
-          if [[ -n "${PREFIX:-}" ]]; then
-            DEST="gs://${BUCKET}/${PREFIX%/}/"
-          else
-            DEST="gs://${BUCKET}/"
-          fi
-          echo "Uploading DAG: ${LOCAL_DAG_PATH} -> ${DEST}"
-          gsutil cp "${LOCAL_DAG_PATH}" "${DEST}"
-
   # -------------------------------------------------------------------
   # 3) (Optional) Upload Spark job artifact to a bucket per branch
   #     - You can remove these two jobs if you don’t need the Spark copy.
