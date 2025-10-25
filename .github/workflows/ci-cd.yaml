@@ -117,25 +117,6 @@ jobs:
           echo "Caller : $CALLER"
           echo "Region : $REGION"
           echo "Env    : $ENV_NAME"
-          PROJECT_ID="$(gcloud config get-value project)"
-          REGION="${{ vars.COMPOSER_REGION }}"
-          ENV_NAME="${{ env.COMPOSER_ENV }}"
-          ENV_SA_EMAIL="$(gcloud composer environments describe "$COMPOSER_ENV" \
-          --location "$REGION" --format='value(config.nodeConfig.serviceAccount)')"
-
-          gcloud projects add-iam-policy-binding "$PROJECT_ID" \
-          --member="serviceAccount:${ENV_SA_EMAIL}" \
-          --role="roles/dataproc.editor" >/dev/null || true
-          # Enable required APIs (idempotent)
-          gcloud services enable \
-          dataproc.googleapis.com \
-          compute.googleapis.com \
-          bigquery.googleapis.com \
-          logging.googleapis.com \
-          storage.googleapis.com \
-          artifactregistry.googleapis.com \
-          --project "$PROJECT_ID"
-
 
           # --- Decide env SA email (use provided or default name) ---
           if [[ -n "${ENV_SA:-}" ]]; then
@@ -178,18 +159,7 @@ jobs:
           gcloud projects add-iam-policy-binding "$PROJECT_ID" \
             --member="serviceAccount:${COMPOSER_AGENT}" \
             --role="roles/composer.ServiceAgentV2Ext" >/dev/null || true
-          PROJECT_ID="$(gcloud config get-value project)"
-          PROJECT_NUMBER="$(gcloud projects describe "$PROJECT_ID" --format='value(projectNumber)')"
-          SA="${{ vars.DATAPROC_SA }}"
-          SA="${SA:-${PROJECT_NUMBER}-compute@developer.gserviceaccount.com}"
-          echo "Granting roles to SA: $SA in project: $PROJECT_ID"
-
-          for ROLE in roles/dataproc.admin roles/dataprocrm.admin roles/dataproc.serverlessEditor roles/dataproc.serverlessViewer roles/dataproc.serverlessNode
-          do
-            gcloud projects add-iam-policy-binding "$PROJECT_ID" \
-              --member="serviceAccount:$SA" \
-              --role="$ROLE" >/dev/null || true
-          done
+          
 
           # --- Create Composer env if absent (pass SA and optional bucket) ---
           if ! gcloud composer environments describe "$ENV_NAME" --location "$REGION" >/dev/null 2>&1; then
