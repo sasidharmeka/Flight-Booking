@@ -155,10 +155,10 @@ jobs:
           else
             echo "Service account already exists."
           fi
-          gcloud composer environments describe airflow-dev-composer \
-            --location us-central1 \
-            --format='value(config.nodeConfig.serviceAccount)'
-          # likely: composer-env-sa@authentic-codex-475613-p1.iam.gserviceaccount.com
+          # --- Discover env SA email (in case auto-created by Composer) --- 
+          gcloud composer environments describe --location "us-central1" "airflow-dev-composer" \
+          --format='value(config.nodeConfig.serviceAccount)'
+
 
 
           # Editor (sufficient and common)
