@@ -117,6 +117,16 @@ jobs:
           echo "Caller : $CALLER"
           echo "Region : $REGION"
           echo "Env    : $ENV_NAME"
+          # Enable required APIs (idempotent)
+          gcloud services enable \
+          dataproc.googleapis.com \
+          compute.googleapis.com \
+          bigquery.googleapis.com \
+          logging.googleapis.com \
+          storage.googleapis.com \
+          artifactregistry.googleapis.com \
+          --project "$PROJECT_ID"
+
 
           # --- Decide env SA email (use provided or default name) ---
           if [[ -n "${ENV_SA:-}" ]]; then
