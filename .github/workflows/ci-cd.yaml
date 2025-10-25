@@ -270,7 +270,7 @@ jobs:
 
 
 
-      - name: Upload DAG + variables (fast, single update; skips if unchanged)
+      - name: Upload DAG and Import Variables into Airflow
         run: |
           set -euo pipefail
 
@@ -288,14 +288,11 @@ jobs:
           # Choose dev/prod file by branch
           BRANCH="${GITHUB_REF_NAME:-}"
           if [[ "$BRANCH" == "dev" ]]; then
-            LOCAL_VARS_PATH="$LOCAL_VARS_DEV"
-            VARS_SUBDIR="dev"
+            LOCAL_VARS_PATH="$LOCAL_VARS_DEV"; VARS_SUBDIR="dev"
           elif [[ "$BRANCH" == "main" ]]; then
-            LOCAL_VARS_PATH="$LOCAL_VARS_PROD"
-            VARS_SUBDIR="prod"
+            LOCAL_VARS_PATH="$LOCAL_VARS_PROD"; VARS_SUBDIR="prod"
           else
-            LOCAL_VARS_PATH="$LOCAL_VARS_DEV"
-            VARS_SUBDIR="dev"
+            LOCAL_VARS_PATH="$LOCAL_VARS_DEV"; VARS_SUBDIR="dev"
           fi
 
           # Sanity
@@ -314,22 +311,22 @@ jobs:
           gsutil cp "$LOCAL_VARS_PATH" "$VARS_GCS"
 
           # Export for Python
-          export COMPOSER_ENV COMPOSER_REGION LOCAL_VARS_PATH VARS_SUBDIR
+          export COMPOSER_ENV COMPOSER_REGION LOCAL_VARS_PATH
 
           python3 - <<'PY'
-          import json, os, subprocess, shlex, sys, hashlib, tempfile
+          import json, os, subprocess, shlex, sys, hashlib
 
           env_name  = os.environ["COMPOSER_ENV"]
           region    = os.environ["COMPOSER_REGION"]
           vars_path = os.environ["LOCAL_VARS_PATH"]
 
-          # 1) Load variables.json and compute a content hash
-          with open(vars_path, "rb") as f:
-              raw = f.read()
+          # Load variables file + compute a versioned hash so we force one overwrite now
+          raw = open(vars_path, "rb").read()
           md5 = hashlib.md5(raw).hexdigest()
           vars_hash_key = "AIRFLOW_VAR__VARS_HASH"
+          new_hash_value = f"v2:{md5}"   # bump to v2 to override any old quoted values
 
-          # 2) See if the same hash is already set on the environment → skip if unchanged
+          # Read current env vars to decide whether to skip
           desc = subprocess.run(
               ["gcloud","composer","environments","describe",env_name,"--location",region,"--format=json"],
               capture_output=True, text=True
@@ -339,34 +336,37 @@ jobs:
               sys.exit(desc.returncode)
 
           try:
-              import json as _json
-              j = _json.loads(desc.stdout)
-              env_vars = (j.get("config",{})
-                            .get("softwareConfig",{})
-                            .get("envVariables",{}))
-          except Exception as e:
+              j = json.loads(desc.stdout)
+              env_vars = j.get("config", {}).get("softwareConfig", {}).get("envVariables", {})
+          except Exception:
               env_vars = {}
 
-          if env_vars.get(vars_hash_key) == md5:
+          if env_vars.get(vars_hash_key) == new_hash_value:
               print("Variables unchanged (hash match). Skipping Composer update.")
               sys.exit(0)
 
-          # 3) Build one --update-env-variables arg with a custom delimiter (^|^)
           data = json.loads(raw.decode("utf-8"))
+
           def key_to_env(k: str) -> str:
+              # Airflow reads AIRFLOW_VAR_<KEY> for Variable.get("<key>")
               return "AIRFLOW_VAR_" + "".join(c if (c.isalnum() or c=="_") else "_" for c in k.upper())
 
           pairs = []
           for k, v in data.items():
               env_key = key_to_env(k)
-              val = json.dumps(v, ensure_ascii=False)  # keep JSON string
-              val = val.replace("|", r"\|")            # escape our delimiter
+              # IMPORTANT: leave strings as plain values (no quotes); JSON-encode non-strings
+              if isinstance(v, str):
+                  val = v
+              else:
+                  val = json.dumps(v, ensure_ascii=False)
+              # Protect our custom delimiter if it appears in values
+              val = val.replace("|", r"\|")
               pairs.append(f"{env_key}={val}")
 
-          # Add/update the content hash as well
-          pairs.append(f"{vars_hash_key}={md5}")
+          # Add the versioned hash so subsequent runs can skip if unchanged
+          pairs.append(f"{vars_hash_key}={new_hash_value}")
 
-          # Construct single update command
+          # Single Composer update (one restart) using a custom delimiter (^|^)
           arg_value = "^|^" + "|".join(pairs)
           cmd = [
               "gcloud","composer","environments","update",env_name,
@@ -374,11 +374,10 @@ jobs:
               f"--update-env-variables={arg_value}"
           ]
           print(">>", " ".join(shlex.quote(x) for x in cmd))
-          rc = subprocess.call(cmd)
-          sys.exit(rc)
+          sys.exit(subprocess.call(cmd))
           PY
 
-              echo "Done. (If an update was needed, Composer components restart once.)"
+          echo "Done. (If an update was needed, Composer components restarted once.)"
 
 
 
