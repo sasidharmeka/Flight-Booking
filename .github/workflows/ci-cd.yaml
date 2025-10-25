@@ -121,7 +121,7 @@ jobs:
           REGION="${{ vars.COMPOSER_REGION }}"
           ENV_NAME="${{ env.COMPOSER_ENV }}"
           ENV_SA_EMAIL="$(gcloud composer environments describe "$ENV_NAME" \
-          --location "$REGION" --format='value(config.nodeConfig.serviceAccount)')"
+           --location "$REGION" --format='value(config.nodeConfig.serviceAccount)')"
 
           gcloud projects add-iam-policy-binding "$PROJECT_ID" \
           --member="serviceAccount:${ENV_SA_EMAIL}" \
@@ -155,22 +155,6 @@ jobs:
           else
             echo "Service account already exists."
           fi
-          # --- Discover env SA email (in case auto-created by Composer) --- 
-          gcloud composer environments describe --location "us-central1" "airflow-dev-composer" \
-          --format='value(config.nodeConfig.serviceAccount)'
-
-
-
-          # Editor (sufficient and common)
-          gcloud projects add-iam-policy-binding authentic-codex-475613-p1 \
-            --member="serviceAccount:composer-env-sa@authentic-codex-475613-p1.iam.gserviceaccount.com" \
-            --role="roles/dataproc.editor"
-
-          # or Serverless Editor (narrower to Dataproc Serverless)
-          gcloud projects add-iam-policy-binding authentic-codex-475613-p1 \
-            --member="serviceAccount:composer-env-sa@authentic-codex-475613-p1.iam.gserviceaccount.com" \
-            --role="roles/dataproc.serverlessEditor"
-
 
           # --- Ensure IAM: env SA has composer.worker (minimum for Composer runtime) ---
           gcloud projects add-iam-policy-binding "$PROJECT_ID" \
