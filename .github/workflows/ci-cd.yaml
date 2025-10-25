@@ -117,6 +117,15 @@ jobs:
           echo "Caller : $CALLER"
           echo "Region : $REGION"
           echo "Env    : $ENV_NAME"
+          PROJECT_ID="$(gcloud config get-value project)"
+          REGION="${{ vars.COMPOSER_REGION }}"
+          ENV_NAME="${{ env.COMPOSER_ENV }}"
+          ENV_SA_EMAIL="$(gcloud composer environments describe "$ENV_NAME" \
+          --location "$REGION" --format='value(config.nodeConfig.serviceAccount)')"
+
+          gcloud projects add-iam-policy-binding "$PROJECT_ID" \
+          --member="serviceAccount:${ENV_SA_EMAIL}" \
+          --role="roles/dataproc.editor" >/dev/null || true
           # Enable required APIs (idempotent)
           gcloud services enable \
           dataproc.googleapis.com \
