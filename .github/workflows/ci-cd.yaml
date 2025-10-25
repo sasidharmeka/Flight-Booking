@@ -90,7 +90,7 @@ jobs:
           ENV_SINGLE: ${{ vars.COMPOSER_ENV_NAME }}
           IMAGE_VERSION: ${{ vars.COMPOSER_IMAGE_VERSION }}    # e.g., composer-2-airflow-2 or a pinned version.
           ENV_SA: ${{ vars.COMPOSER_ENV_SA }}                  # optional; if empty, we'll create/use composer-env-sa@<project>
-          COMPOSER_BUCKET: ${{ vars.COMPOSER_BUCKET }}         # optional; if set, Composer will use this bucket.
+          COMPOSER_BUCKET: ${{ vars.COMPOSER_BUCKET }}         # optional; if set, Composer will use this bucket...
         run: |
           set -euo pipefail
 
