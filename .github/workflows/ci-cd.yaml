@@ -155,6 +155,22 @@ jobs:
           else
             echo "Service account already exists."
           fi
+          gcloud composer environments describe airflow-dev-composer \
+            --location us-central1 \
+            --format='value(config.nodeConfig.serviceAccount)'
+          # likely: composer-env-sa@authentic-codex-475613-p1.iam.gserviceaccount.com
+
+
+          # Editor (sufficient and common)
+          gcloud projects add-iam-policy-binding authentic-codex-475613-p1 \
+            --member="serviceAccount:composer-env-sa@authentic-codex-475613-p1.iam.gserviceaccount.com" \
+            --role="roles/dataproc.editor"
+
+          # or Serverless Editor (narrower to Dataproc Serverless)
+          gcloud projects add-iam-policy-binding authentic-codex-475613-p1 \
+            --member="serviceAccount:composer-env-sa@authentic-codex-475613-p1.iam.gserviceaccount.com" \
+            --role="roles/dataproc.serverlessEditor"
+
 
           # --- Ensure IAM: env SA has composer.worker (minimum for Composer runtime) ---
           gcloud projects add-iam-policy-binding "$PROJECT_ID" \
