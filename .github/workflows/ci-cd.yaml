@@ -120,7 +120,7 @@ jobs:
           PROJECT_ID="$(gcloud config get-value project)"
           REGION="${{ vars.COMPOSER_REGION }}"
           ENV_NAME="${{ env.COMPOSER_ENV }}"
-          ENV_SA_EMAIL="$(gcloud composer environments describe "$COMPOSER_ENV"
+          ENV_SA_EMAIL="$(gcloud composer environments describe "$COMPOSER_ENV"\
           --location "$REGION" --format='value(config.nodeConfig.serviceAccount)')"
 
           gcloud projects add-iam-policy-binding "$PROJECT_ID" \
