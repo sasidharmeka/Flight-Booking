@@ -172,6 +172,11 @@ jobs:
           
           ENV_SA_EMAIL="$(gcloud composer environments describe "$ENV_NAME" --location "$REGION" \
           --project "$PROJECT_ID" --format='value(config.nodeConfig.serviceAccount)')"
+          # Ensure the BigQuery dataset exists
+          if ! bq --project_id=authentic-codex-475613-p1 show flight_data_dev >/dev/null 2>&1; then
+            echo "Creating BigQuery dataset: flight_data_dev"
+            bq --location=US --project_id=authentic-codex-475613-p1 mk -d flight_data_dev
+          fi
 
 
           gcloud iam service-accounts add-iam-policy-binding "$EXEC_SA" \
