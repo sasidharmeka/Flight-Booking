@@ -150,6 +150,45 @@ jobs:
             --member="serviceAccount:${CALLER}" \
             --role="roles/composer.admin" >/dev/null || true
 
+                  # =====================================================================
+          # Enable Dataproc API (and commonly needed services) + grant Dataproc roles
+          # =====================================================================
+          echo "Enabling core services (idempotent)..."
+          gcloud services enable \
+            dataproc.googleapis.com \
+            compute.googleapis.com \
+            bigquery.googleapis.com \
+            logging.googleapis.com \
+            storage.googleapis.com \
+            artifactregistry.googleapis.com \
+            --project "$PROJECT_ID"
+
+          # Execution SA for Dataproc Serverless batches:
+          # - prefer repo/org variable DATAPROC_SA when set
+          # - else use the project's default compute SA
+          EXEC_SA="${{ vars.DATAPROC_SA }}"
+          EXEC_SA="${EXEC_SA:-${PROJECT_NUMBER}-compute@developer.gserviceaccount.com}"
+          echo "Dataproc execution SA: ${EXEC_SA}"
+
+          # The caller that invokes createBatch is the Composer environment SA.
+          # Grant it permission to create batches.
+          gcloud projects add-iam-policy-binding "$PROJECT_ID" \
+            --member="serviceAccount:${ENV_SA_EMAIL}" \
+            --role="roles/dataproc.editor" >/dev/null || true
+          # (Alternative narrower role):
+          # gcloud projects add-iam-policy-binding "$PROJECT_ID" \
+          #   --member="serviceAccount:${ENV_SA_EMAIL}" \
+          #   --role="roles/dataproc.serverlessEditor" >/dev/null || true
+
+          # Optional: grant Dataproc roles to the execution SA as well (not strictly required to create batches)
+          gcloud projects add-iam-policy-binding "$PROJECT_ID" \
+            --member="serviceAccount:${EXEC_SA}" \
+            --role="roles/dataproc.serverlessViewer" >/dev/null || true
+          # If you prefer, you can make it serverlessEditor instead of viewer:
+          # gcloud projects add-iam-policy-binding "$PROJECT_ID" \
+          #   --member="serviceAccount:${EXEC_SA}" \
+          #   --role="roles/dataproc.serverlessEditor" >/dev/null || true
+
           gcloud iam service-accounts add-iam-policy-binding "$ENV_SA_EMAIL" \
             --member="serviceAccount:${CALLER}" \
             --role="roles/iam.serviceAccountUser" >/dev/null || true
