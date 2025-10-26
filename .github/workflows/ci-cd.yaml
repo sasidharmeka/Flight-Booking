@@ -142,7 +142,7 @@ jobs:
             --member="serviceAccount:${ENV_SA_EMAIL}" \
             --role="roles/composer.worker" >/dev/null || true
 
-          
+          gcloud services enable dataproc.googleapis.com --project="$PROJECT_ID
 
           # --- Ensure IAM: CI caller can create envs & act as env SA ---
           # Note: CALLER is your GitHub Actions SA (from GCP_SA_KEY).
@@ -214,6 +214,24 @@ jobs:
           gcloud projects add-iam-policy-binding "$PROJECT_ID" \
             --member="serviceAccount:${COMPOSER_AGENT}" \
             --role="roles/composer.ServiceAgentV2Ext" >/dev/null || true
+
+                    # Give Dataproc execution Service Account (ENV_SA) the needed BigQuery and Dataproc roles
+          gcloud projects add-iam-policy-binding "$PROJECT_ID" \
+              --member="serviceAccount:${ENV_SA}" \
+              --role="roles/dataproc.worker"
+
+          gcloud projects add-iam-policy-binding "$PROJECT_ID" \
+              --member="serviceAccount:${ENV_SA}" \
+              --role="roles/bigquery.jobUser"
+
+          gcloud projects add-iam-policy-binding "$PROJECT_ID" \
+              --member="serviceAccount:${ENV_SA}" \
+              --role="roles/bigquery.dataEditor"
+
+          gcloud projects add-iam-policy-binding "$PROJECT_ID" \
+              --member="serviceAccount:${ENV_SA}" \
+              --role="roles/logging.logWriter"
+
           
 
           # --- Create Composer env if absent (pass SA and optional bucket) ---
