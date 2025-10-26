@@ -222,19 +222,19 @@ jobs:
 
                     # Give Dataproc execution Service Account (ENV_SA) the needed BigQuery and Dataproc roles
           gcloud projects add-iam-policy-binding "$PROJECT_ID" \
-              --member="serviceAccount:${ENV_SA}" \
+              --member="serviceAccount:${EXEC_SA}" \
               --role="roles/dataproc.worker"
 
           gcloud projects add-iam-policy-binding "$PROJECT_ID" \
-              --member="serviceAccount:${ENV_SA}" \
+              --member="serviceAccount:${EXEC_SA}" \
               --role="roles/bigquery.jobUser"
 
           gcloud projects add-iam-policy-binding "$PROJECT_ID" \
-              --member="serviceAccount:${ENV_SA}" \
+              --member="serviceAccount:${EXEC_SA}" \
               --role="roles/bigquery.dataEditor"
 
           gcloud projects add-iam-policy-binding "$PROJECT_ID" \
-              --member="serviceAccount:${ENV_SA}" \
+              --member="serviceAccount:${EXEC_SA}" \
               --role="roles/logging.logWriter"
 
           
