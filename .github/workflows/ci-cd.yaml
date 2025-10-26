@@ -169,6 +169,22 @@ jobs:
           EXEC_SA="${{ vars.DATAPROC_SA }}"
           EXEC_SA="${EXEC_SA:-${PROJECT_NUMBER}-compute@developer.gserviceaccount.com}"
           echo "Dataproc execution SA: ${EXEC_SA}"
+          
+          ENV_SA_EMAIL="$(gcloud composer environments describe "$ENV_NAME" --location "$REGION" \
+          --project "$PROJECT_ID" --format='value(config.nodeConfig.serviceAccount)')"
+
+
+          gcloud iam service-accounts add-iam-policy-binding "$EXEC_SA" \
+            --member="serviceAccount:${ENV_SA_EMAIL}" \
+            --role="roles/iam.serviceAccountUser" \
+            --project "$PROJECT_ID" >/dev/null || true
+
+          gcloud iam service-accounts add-iam-policy-binding "$EXEC_SA" \
+            --member="serviceAccount:${ENV_SA_EMAIL}" \
+            --role="roles/iam.serviceAccountTokenCreator" \
+            --project "$PROJECT_ID" >/dev/null || true
+
+          echo "Composer SA '${ENV_SA_EMAIL}' can now act as '${EXEC_SA}'."
 
           # The caller that invokes createBatch is the Composer environment SA.
           # Grant it permission to create batches.
