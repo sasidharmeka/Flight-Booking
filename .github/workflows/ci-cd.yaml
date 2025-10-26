@@ -142,7 +142,7 @@ jobs:
             --member="serviceAccount:${ENV_SA_EMAIL}" \
             --role="roles/composer.worker" >/dev/null || true
 
-          gcloud services enable dataproc.googleapis.com --project="$PROJECT_ID
+          gcloud services enable dataproc.googleapis.com --project="$PROJECT_ID"
 
           # --- Ensure IAM: CI caller can create envs & act as env SA ---
           # Note: CALLER is your GitHub Actions SA (from GCP_SA_KEY).
