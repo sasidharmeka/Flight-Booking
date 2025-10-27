@@ -164,7 +164,7 @@ jobs:
             --project "$PROJECT_ID"
 
           # Execution SA for Dataproc Serverless batches:
-          # - prefer repo/org variable DATAPROC_SA when set
+          # - prefer repo/org variable DATAPROC_SA when set..
           # - else use the project's default compute SA
           EXEC_SA="${{ vars.DATAPROC_SA }}"
           EXEC_SA="${EXEC_SA:-${PROJECT_NUMBER}-compute@developer.gserviceaccount.com}"
