@@ -164,7 +164,7 @@ jobs:
             --project "$PROJECT_ID"
 
           # Execution SA for Dataproc Serverless batches:
-          # - prefer repo/org variable DATAPROC_SA when set..
+          # - prefer repo/org variable DATAPROC_SA when set
           # - else use the project's default compute SA
           EXEC_SA="${{ vars.DATAPROC_SA }}"
           EXEC_SA="${EXEC_SA:-${PROJECT_NUMBER}-compute@developer.gserviceaccount.com}"
@@ -177,19 +177,7 @@ jobs:
             echo "Creating BigQuery dataset: flight_data_dev"
             bq --location=US --project_id=authentic-codex-475613-p1 mk -d flight_data_dev
           fi
-          COMPUTE_SA="406744450075-compute@developer.gserviceaccount.com"
 
-          gcloud projects add-iam-policy-binding "$PROJECT_ID" \
-            --member="serviceAccount:${COMPUTE_SA}" \
-            --role="roles/composer.worker"
-
-          gcloud projects add-iam-policy-binding "$PROJECT_ID" \
-            --member="serviceAccount:${COMPUTE_SA}" \
-            --role="roles/composer.admin"
-
-          gcloud projects add-iam-policy-binding "$PROJECT_ID" \
-            --member="serviceAccount:${COMPUTE_SA}" \
-            --role="roles/serviceusage.serviceUsageConsumer"
 
           gcloud iam service-accounts add-iam-policy-binding "$EXEC_SA" \
             --member="serviceAccount:${ENV_SA_EMAIL}" \
